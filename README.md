@@ -9,22 +9,57 @@ A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript
 
 # Features
 
-- ✅ Extracts queries/mutations from:
-  - `gql` or `graphql` tagged templates
-  - Inline `fetch()` calls with GraphQL bodies
-  - JavaScript string/Template literals
-  - Commented-out GraphQL queries
-    
-- ✅ Streams large files to avoid memory exhaustion
-- ✅ Crawls entire directories with `glob` patterns
-- ✅ Detects queries built from string concatenation
-- ✅ Supports introspection of live GraphQL endpoints
-- ✅ Exports results to JSON and Postman Collection format
-- ✅ CLI progress bar + parallel processing for speed
-- ✅ Plugin system for custom AST visitors
-- ✅ Parses imported `.graphql` fragments
-- ✅ Built with Babel scope analysis for dynamic detection
+✅ Extracts GraphQL Operations from various sources:
 
+- Tagged templates (gql, graphql, apollo, etc.)
+
+- Inline fetch() or HTTP client calls with GraphQL request bodies
+
+- JavaScript string literals and Template literals
+
+- Commented-out GraphQL queries
+
+- Queries built from string concatenation
+
+✅ Efficiently Handles Large Files:
+
+- Streams files to avoid memory exhaustion, even for large files.
+
+✅ Crawl Directories with Glob Patterns:
+
+- Supports directory crawling with customizable glob patterns (e.g., src/**/*.js).
+
+✅ Detects Concatenated Queries:
+
+- Automatically detects and extracts queries built from string concatenation or variables.
+
+✅ Supports Live GraphQL Endpoint Introspection:
+
+- Fetches and saves GraphQL schema from live endpoints with optional authentication headers (Bearer token, Cookie).
+
+✅ Exports Results in Multiple Formats:
+
+- Outputs extracted queries/mutations as JSON.
+
+- Optionally exports as Postman Collection for API testing.
+
+✅ Enhanced Performance with Parallel Processing:
+
+- CLI progress bar for real-time feedback.
+
+- Supports parallel file processing with configurable concurrency for faster operations.
+
+✅ Plugin System for Custom AST Visitors:
+
+- Extensible with plugins for custom Abstract Syntax Tree (AST) visitors, allowing users to add custom logic or handle specific GraphQL patterns.
+
+✅ Parses Imported .graphql Fragments:
+
+- Supports parsing and extracting queries or fragments imported from .graphql files.
+
+✅ Babel Scope Analysis for Dynamic Detection:
+
+- Utilizes Babel's scope analysis for precise and dynamic detection of GraphQL queries and operations within JavaScript files.
 
 
 
