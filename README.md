@@ -239,7 +239,7 @@ Introspect live endpoints to pull down complete schema definitions in JSON form.
 Trace variable usage, string concatenation, imported fragments, and dynamic template logic via Babel’s AST scope analysis.
 
 
-
+# Final Note
 ✅ This is my first publicly released  tool — feedback, issues, and contributions are very welcome!
 
 ✅ SchemaFinder is open-source and licensed under the MIT License.
