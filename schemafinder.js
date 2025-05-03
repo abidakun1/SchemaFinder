@@ -21,7 +21,7 @@ const HTTP_CLIENTS = new Set(['fetch', 'axios', 'request']);
 
 program
   .version('1.1.0')
-  .option('-i, --input <pattern>', 'Glob pattern for input files', '**/*.js')
+  .option('-i, --input <pattern>', 'Glob pattern for input files or remote URL')
   .option('-o, --output <file>', 'Output JSON file path', 'graphql_queries.json')
   .option('--postman', 'Generate Postman collection')
   .option('--introspect <url>', 'Introspect GraphQL endpoint')
@@ -31,10 +31,46 @@ program
 
 const options = program.opts();
 
+function isRemotePath(p) {
+  return /^https?:\/\//.test(p);
+}
+
+async function fetchRemoteCode(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.statusText}`);
+  return await res.text();
+}
+
+function validateRequiredVariables() {
+  if (!options.introspect && !options.input) {
+    console.error('❌ Error: You must provide either --input <pattern> or --introspect <url>');
+    program.help({ error: true });
+  }
+
+  if (!options.output || typeof options.output !== 'string') {
+    console.error('❌ Error: --output <file> is required');
+    program.help({ error: true });
+  }
+
+  if (isNaN(options.concurrency)) {
+    console.error('❌ Concurrency must be a number');
+    process.exit(1);
+  }
+
+  if (options.concurrency < 1) {
+    console.error('❌ Concurrency must be at least 1');
+    process.exit(1);
+  }
+
+  if (options.introspect && !options.introspect.startsWith('http')) {
+    console.error('❌ Introspection URL must start with http:// or https://');
+    process.exit(1);
+  }
+}
+
 if (!isMainThread) {
-  // Worker thread processing
   parentPort.on('message', ({ filePath, code }) => {
-    const operations = new Map(); // Using Map to deduplicate by operation signature
+    const operations = new Map();
 
     function extractOperation(text, variables = {}) {
       const matches = [...text.matchAll(GQL_PATTERN)];
@@ -42,7 +78,6 @@ if (!isMainThread) {
         const [fullMatch, operationName, args] = match;
         const signature = fullMatch.replace(/\s+/g, ' ').trim();
 
-        // Extract variables from arguments if they exist
         if (args) {
           args.split(',').forEach(arg => {
             const [varName, varType] = arg.split(':').map(s => s.trim());
@@ -120,18 +155,13 @@ if (!isMainThread) {
       traverse(ast, {
         TaggedTemplateExpression(path) {
           if (GQL_TAGS.has(path.node.tag.name)) {
-            const text = path.node.quasi.quasis
-              .map(q => q.value.cooked)
-              .join('');
+            const text = path.node.quasi.quasis.map(q => q.value.cooked).join('');
             extractOperation(text);
           }
         },
         CallExpression(path) {
           const callee = path.node.callee;
-          const calleeName = callee.name ||
-                           (callee.property && callee.property.name) ||
-                           '';
-
+          const calleeName = callee.name || (callee.property && callee.property.name) || '';
           if (HTTP_CLIENTS.has(calleeName)) {
             const args = path.node.arguments;
             if (args.length < 2) return;
@@ -145,10 +175,7 @@ if (!isMainThread) {
 
             if (bodyProp) {
               let bodyText = '';
-              let variables = {};
-
-              // First extract variables from the call
-              variables = extractVariablesFromCode(configArg);
+              let variables = extractVariablesFromCode(configArg);
 
               if (bodyProp.value.type === 'StringLiteral') {
                 bodyText = bodyProp.value.value;
@@ -182,9 +209,7 @@ if (!isMainThread) {
           if (path.node.init && path.node.init.type === 'TaggedTemplateExpression') {
             const tag = path.node.init.tag.name;
             if (GQL_TAGS.has(tag)) {
-              const text = path.node.init.quasi.quasis
-                .map(q => q.value.cooked)
-                .join('');
+              const text = path.node.init.quasi.quasis.map(q => q.value.cooked).join('');
               extractOperation(text);
             }
           }
@@ -213,10 +238,8 @@ async function processFiles(filePaths) {
   bar.start(filePaths.length, 0);
 
   const limit = pLimit(options.concurrency);
-  const allOperations = new Map(); // Deduplicate across files
-  const workers = Array.from({ length: Math.min(options.concurrency, filePaths.length) },
-    () => new Worker(__filename)
-  );
+  const allOperations = new Map();
+  const workers = Array.from({ length: Math.min(options.concurrency, filePaths.length) }, () => new Worker(__filename));
 
   const processFile = async (filePath) => {
     const worker = workers.pop();
@@ -244,10 +267,7 @@ async function processFiles(filePaths) {
           fs.createReadStream(filePath)
             .on('data', chunk => chunks.push(chunk))
             .on('end', () => {
-              worker.postMessage({
-                filePath,
-                code: Buffer.concat(chunks).toString()
-              });
+              worker.postMessage({ filePath, code: Buffer.concat(chunks).toString() });
             })
             .on('error', () => {
               workers.push(worker);
@@ -282,44 +302,102 @@ function generatePostmanCollection(operations) {
     variable: [
       { key: "GRAPHQL_ENDPOINT", value: "", type: "string" }
     ],
-    item: operations.map(op => {
-      // Extract just the operation name without file path
-      const operationName = op.name || 'AnonymousOperation';
-      return {
-        name: operationName, // Just show the operation name
-        request: {
-          method: "POST",
-          header: [
-            { key: "Content-Type", value: "application/json" },
-            { key: "Accept", value: "application/json" }
-          ],
-          body: {
-            mode: "graphql",
-            graphql: {
-              query: op.operation,
-              variables: JSON.stringify(op.variables, null, 2)
-            }
-          },
-          url: {
-            raw: "{{GRAPHQL_ENDPOINT}}",
-            host: ["{{GRAPHQL_ENDPOINT}}"]
+    item: operations.map(op => ({
+      name: op.name || 'AnonymousOperation',
+      request: {
+        method: "POST",
+        header: [
+          { key: "Content-Type", value: "application/json" },
+          { key: "Accept", value: "application/json" }
+        ],
+        body: {
+          mode: "graphql",
+          graphql: {
+            query: op.operation,
+            variables: JSON.stringify(op.variables, null, 2)
           }
+        },
+        url: {
+          raw: "{{GRAPHQL_ENDPOINT}}",
+          host: ["{{GRAPHQL_ENDPOINT}}"]
         }
-      };
-    })
+      }
+    }))
   };
 }
 
+async function introspectEndpoint(url) {
+  const introspectionQuery = {
+    query: `query IntrospectionQuery {
+      __schema {
+        queryType { name }
+        mutationType { name }
+        subscriptionType { name }
+        types { ...FullType }
+        directives {
+          name locations args { ...InputValue }
+        }
+      }
+    }
+    fragment FullType on __Type {
+      kind name description
+      fields(includeDeprecated: true) {
+        name description args { ...InputValue } type { ...TypeRef }
+        isDeprecated deprecationReason
+      }
+      inputFields { ...InputValue }
+      interfaces { ...TypeRef }
+      enumValues(includeDeprecated: true) {
+        name description isDeprecated deprecationReason
+      }
+      possibleTypes { ...TypeRef }
+    }
+    fragment InputValue on __InputValue {
+      name description type { ...TypeRef } defaultValue
+    }
+    fragment TypeRef on __Type {
+      kind name
+      ofType { kind name ofType { kind name ofType { kind name } } }
+    }`
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(introspectionQuery)
+    });
+    const schema = await res.json();
+    fs.writeFileSync(options.output, JSON.stringify(schema, null, 2));
+    console.log(`✅ Introspection saved to ${options.output}`);
+  } catch (error) {
+    console.error('❌ Introspection failed:', error.message);
+    process.exit(1);
+  }
+}
+
 async function main() {
+  validateRequiredVariables();
+
   if (options.introspect) {
     await introspectEndpoint(options.introspect);
     return;
   }
 
-  const filePaths = await fg([options.input], {
-    absolute: true,
-    ignore: ['**/node_modules/**', '**/dist/**', '**/build/**']
-  });
+  let filePaths = [];
+
+  if (isRemotePath(options.input)) {
+    console.log(`🌐 Fetching remote JS from ${options.input}`);
+    const code = await fetchRemoteCode(options.input);
+    const tmpFile = path.join(__dirname, '__tmp_remote.js');
+    fs.writeFileSync(tmpFile, code);
+    filePaths = [tmpFile];
+  } else {
+    filePaths = await fg([options.input], {
+      absolute: true,
+      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**']
+    });
+  }
 
   if (!filePaths.length) {
     console.log('ℹ️ No files found matching pattern:', options.input);
@@ -341,6 +419,10 @@ async function main() {
     const postmanFile = options.output.replace('.json', '.postman.json');
     fs.writeFileSync(postmanFile, JSON.stringify(generatePostmanCollection(queries), null, 2));
     console.log(`📦 Postman collection saved to ${postmanFile}`);
+  }
+
+  if (isRemotePath(options.input)) {
+    fs.unlinkSync(path.join(__dirname, '__tmp_remote.js'));
   }
 }
 
