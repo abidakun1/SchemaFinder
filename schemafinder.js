@@ -21,15 +21,18 @@ const HTTP_CLIENTS = new Set(['fetch', 'axios', 'request']);
 
 program
   .version('1.1.0')
-  .option('-i, --input <pattern>', 'Glob pattern for input files or remote URL')
-  .option('-o, --output <file>', 'Output JSON file path', 'graphql_queries.json')
-  .option('--postman', 'Generate Postman collection')
-  .option('--introspect <url>', 'Introspect GraphQL endpoint')
-  .option('--concurrency <number>', 'Max concurrent files', parseInt, DEFAULT_CONCURRENCY)
-  .option('--verbose', 'Enable verbose logging')
+  .option('-i, --input <pattern>',     'Glob/file/URL for input files')
+  .option('-o, --output <file>',       'Output JSON file')
+  .option('--postman',                 'Generate Postman collection')
+  .option('--introspect <url>',        'Introspect GraphQL endpoint')
+  .option('--authToken <token>',       'Bearer token for authenticated endpoints')
+  .option('--cookie <cookie>',         'Cookie header for authenticated endpoints')
+  .option('--concurrency <n>',         'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
+  .option('--verbose',                 'Verbose logging')
   .parse(process.argv);
 
 const options = program.opts();
+
 
 function isRemotePath(p) {
   return /^https?:\/\//.test(p);
@@ -327,54 +330,42 @@ function generatePostmanCollection(operations) {
 }
 
 async function introspectEndpoint(url) {
-  const introspectionQuery = {
-    query: `query IntrospectionQuery {
-      __schema {
-        queryType { name }
-        mutationType { name }
-        subscriptionType { name }
-        types { ...FullType }
-        directives {
-          name locations args { ...InputValue }
-        }
-      }
-    }
-    fragment FullType on __Type {
-      kind name description
-      fields(includeDeprecated: true) {
-        name description args { ...InputValue } type { ...TypeRef }
-        isDeprecated deprecationReason
-      }
-      inputFields { ...InputValue }
-      interfaces { ...TypeRef }
-      enumValues(includeDeprecated: true) {
-        name description isDeprecated deprecationReason
-      }
-      possibleTypes { ...TypeRef }
-    }
-    fragment InputValue on __InputValue {
-      name description type { ...TypeRef } defaultValue
-    }
-    fragment TypeRef on __Type {
-      kind name
-      ofType { kind name ofType { kind name ofType { kind name } } }
-    }`
-  };
+  const introspectionQuery = { query: `query IntrospectionQuery { __schema { types { name } } }` };
+
+  // start with the required header...
+  const headers = { 'Content-Type': 'application/json' };
+
+  // …add Authorization if they passed --authToken
+  if (options.authToken) {
+    headers['Authorization'] = `Bearer ${options.authToken}`;
+  }
+
+  // …and add Cookie if they passed --cookie
+  if (options.cookie) {
+    headers['Cookie'] = options.cookie;
+  }
 
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(introspectionQuery)
+      headers,
+      body: JSON.stringify(introspectionQuery),
     });
+
+    if (!res.ok) {
+      console.error(`❌ Introspection failed: ${res.status} ${res.statusText}`);
+      process.exit(1);
+    }
+
     const schema = await res.json();
     fs.writeFileSync(options.output, JSON.stringify(schema, null, 2));
     console.log(`✅ Introspection saved to ${options.output}`);
-  } catch (error) {
-    console.error('❌ Introspection failed:', error.message);
+  } catch (err) {
+    console.error('❌ Introspection error:', err.message);
     process.exit(1);
   }
 }
+
 
 async function main() {
   validateRequiredVariables();
