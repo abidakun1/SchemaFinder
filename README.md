@@ -53,9 +53,7 @@ A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript
 
 - Extensible with plugins for custom Abstract Syntax Tree (AST) visitors, allowing users to add custom logic or handle specific GraphQL patterns.
 
-✅ Parses Imported .graphql Fragments:
 
-- Supports parsing and extracting queries or fragments imported from .graphql files.
 
 ✅ Babel Scope Analysis for Dynamic Detection:
 
