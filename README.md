@@ -154,10 +154,6 @@ SchemaFinder acts like a static code analysis tool for GraphQL, giving you full 
 
 - ✅ What GraphQL operations exist in JS code
 
-- ✅ How they are constructed (dynamic, static, or hidden)
-
-- ✅ What schema a remote endpoint exposes
-
 
 
 
