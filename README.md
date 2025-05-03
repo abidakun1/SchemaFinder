@@ -1,9 +1,7 @@
 # SchemaFinder
 
 
-
-Extract GraphQL queries, mutations, and schemas from JavaScript files and live endpoints — optimized for js auditing, bug hunter, and recon.
-
+A Node.js CLI tool to extract GraphQL queries, mutations, and schemas from JavaScript code files and live endpoints - optimized for JS auditing and recon. Inspired by [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
 
 
 
@@ -28,6 +26,8 @@ Extract GraphQL queries, mutations, and schemas from JavaScript files and live e
 - ✅ Built with Babel scope analysis for dynamic detection
 
 
+
+
 # Installation
 
 ```bash
@@ -36,6 +36,8 @@ cd schemafinder
 npm install
 npm link   # or use directly via `node schemafinder.js`
 ```
+
+
 
 
 # Usage
@@ -74,6 +76,8 @@ To introspect a remote GraphQL endpoint and extract its schema:
 schemafinder -o schema.json --introspect "https://example.com/graphql"
 ```
 
+
+
 # Options
 
 ```
@@ -82,6 +86,9 @@ schemafinder -o schema.json --introspect "https://example.com/graphql"
 --postman                         Also export queries to Postman collection format
 --introspect <url>                URL of GraphQL endpoint to introspect schema
 ```
+
+
+
 
 
 # How It Works — Step-by-Step
@@ -152,9 +159,11 @@ Optionally, a .postman.json and/or schema.json is created depending on flags
 
 SchemaFinder acts like a static code analysis tool for GraphQL, giving you full visibility into:
 
-- ✅ What GraphQL operations exist in JS code
+✅ What GraphQL operations exist in JS code
 
+✅ The structure of GraphQL schemas
 
+✅ How queries/mutations are being constructed
 
 
 
