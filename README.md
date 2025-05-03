@@ -126,66 +126,87 @@ schemafinder -o schema.json --introspect "https://example.com/graphql"
 
 
 # How It Works — Step-by-Step
+How It Works — Step-by-Step
 
 1. Input Sources
+You can point SchemaFinder at various input sources:
 
- ✅ You point SchemaFinder at:
+✅ Single JavaScript file:
 
-- ✅ A single .js file (-i app.js)
-- ✅ A remote js file (-i https://example.com/main.js)
-- ✅ A directory or glob pattern (-i src/**/*.js)
-- ✅ A live GraphQL endpoint (--introspect https://api.example.com/graphql)
+-i app.js
+
+✅ Remote JavaScript file:
+
+-i https://example.com/main.js
+
+✅ Directory or glob pattern:
+
+-i src/**/*.js
+
+✅ Live GraphQL endpoint:
+
+--introspect https://api.example.com/graphql
 
 2. File Parsing
-   
-For JavaScript input:
+For JavaScript input files:
 
-- ✅ Uses fast-glob to recursively scan all .js files
+✅ Recursively scans .js files using fast-glob (supports directories and patterns).
 
-- ✅ Each file is streamed line-by-line (efficient for large files)
+✅ Efficient line-by-line streaming of files for large files, reducing memory usage.
 
-- ✅ Babel parser (@babel/parser) converts JS code to an AST (Abstract Syntax Tree)
+✅ Babel parser (@babel/parser) converts JavaScript code into an Abstract Syntax Tree (AST).
 
-- ✅ Babel traverse (@babel/traverse) walks the AST to identify GraphQL-related nodes
+✅ Babel traverse (@babel/traverse) walks through the AST to identify GraphQL-related nodes in the code.
 
 3. GraphQL Detection Logic
-Detects GraphQL snippets from:
+The tool detects GraphQL operations from various sources:
 
-- ✅ gql or graphql tagged template literals
+✅ Tagged template literals:
 
-- ✅  fetch() calls with GraphQL body payloads
+Detects gql, graphql, and similar tagged templates.
 
-- ✅  Raw string literals containing query/mutation
+✅ fetch() calls:
 
-- ✅  Template literals or string concatenations
+Detects GraphQL queries in fetch() calls with GraphQL body payloads.
 
-- ✅  Inline comments or block comments with GraphQL queries
+✅ Raw string literals:
 
-- ✅  Imported .graphql fragments (when included via loader)
+Identifies query/mutation strings written directly in JavaScript code.
 
-- ✅  Also uses scope.getBinding() to resolve simple variable assignments (e.g., const myQuery = "...";).
+✅ Template literals or string concatenations:
 
+Detects dynamically built queries using string templates or concatenation.
 
+✅ Inline and block comments:
+
+Detects GraphQL queries embedded in comments (e.g., /* ... */ or // ...).
+
+✅ Imported .graphql fragments:
+
+Automatically processes .graphql fragments when included via loader.
+
+✅ Scope resolution:
+
+Uses scope.getBinding() to resolve variables that are assigned GraphQL queries (e.g., const myQuery = "...";).
 
 4. Introspection Support
-If --introspect is used:
+When --introspect is used:
 
-- ✅ Sends an introspection query to the specified GraphQL endpoint using fetch
+✅ Sends an introspection query to the specified GraphQL endpoint using fetch.
 
-- ✅  Parses and saves the returned schema in .json format
+✅ Parses and saves the returned schema in .json format.
 
 5. Postman Collection Export
-With --postman:
+When --postman is used:
 
-- ✅ Wraps each extracted query in a proper Postman request body
+✅ Wraps each extracted query into a proper Postman request body format.
 
-- ✅ Generates a full Postman v2.1 Collection (.postman.json) for quick replaying or fuzzing
+✅ Generates a complete Postman Collection in Postman v2.1 format (.postman.json) for easy API testing, replaying, or fuzzing.
 
 6. Output
-All queries and mutations are written to the file specified with -o
+✅ All extracted queries and mutations are saved in the file specified with -o in JSON format.
 
-Optionally, a .postman.json and/or schema.json is created depending on flags
-
+✅ Depending on the flags used, a .postman.json and/or schema.json may also be created.
 
 
 # Summary
