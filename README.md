@@ -32,7 +32,7 @@ A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript
 
 ```bash
 git clone https://github.com/abidakun1/SchemaFinder.git
-cd schemafinder
+cd SchemaFinder
 npm install
 npm link   # or use directly via `node schemafinder.js`
 ```
