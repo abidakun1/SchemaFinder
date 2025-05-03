@@ -115,10 +115,25 @@ schemafinder -o schema.json --introspect "https://example.com/graphql"
 # Options
 
 ```
--i, --input <glob|url|file>        Input glob pattern, remote JavaScript URL, or local .js file
--o, --output <path>               Output .json file path
---postman                         Also export queries to Postman collection format
---introspect <url>                URL of GraphQL endpoint to introspect schema
+
+Options:
+  -h, --help                      Display help for command
+
+  -i, --input <glob|url|file>     Input source(s):
+                                      • Local JS file (e.g. `app.js`)
+                                      • Glob pattern (e.g. `src/**/*.js`)
+                                      • Remote URL (e.g. `https://…/main.js`)
+
+  -o, --output <path>             Output JSON file path for extracted operations
+  --postman                       Also export extracted operations as a Postman v2.1 collection
+  --introspect <url>              Introspect a live GraphQL endpoint and save its schema as JSON
+
+  --authToken <token>             (Optional) Bearer token to include in Authorization header when introspecting
+  --cookie <cookie>               (Optional) Cookie header to include when introspecting
+
+  --concurrency <number>          (Optional) Max parallel file-processing threads (default: 4)
+  --verbose                       (Optional) Enable verbose logging for debug/output details
+
 ```
 
 
@@ -212,19 +227,19 @@ When --postman is used:
 # Summary
 
 
-SchemaFinder acts like a static code analysis tool for GraphQL, giving you full visibility into:
+SchemaFinder acts like a static‑code analysis tool for GraphQL, giving you full visibility into:
 
-✅ What GraphQL operations exist in JS code
+✅ What GraphQL operations exist in your JS code
+Discover every query, mutation, subscription, and fragment embedded in templates, strings, comments or HTTP calls.
 
 ✅ The structure of GraphQL schemas
+Introspect live endpoints to pull down complete schema definitions in JSON form.
 
-✅ How queries/mutations are being constructed
+✅ How queries and mutations are being constructed
+Trace variable usage, string concatenation, imported fragments, and dynamic template logic via Babel’s AST scope analysis.
 
 
 
-# Final remarks
+✅ This is my first publicly released  tool — feedback, issues, and contributions are very welcome!
 
-✅ This is the first time I publicly built a tool. Contributions are much appreciated!
-
-✅ SchemaFinder is published under the MIT License.
-
+✅ SchemaFinder is open-source and licensed under the MIT License.
