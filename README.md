@@ -169,5 +169,6 @@ SchemaFinder acts like a static code analysis tool for GraphQL, giving you full 
 # Final remarks
 
 ✅ This is the first time I publicly built a tool. Contributions are much appreciated!
+
 ✅ SchemaFinder is published under the MIT License.
 
