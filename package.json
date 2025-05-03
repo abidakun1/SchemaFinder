@@ -1,24 +1,10 @@
 {
   "name": "graphql-extractor-cli",
   "version": "1.0.0",
-  "description": "CLI tool to extract GraphQL queries and mutations from JavaScript code files",
   "main": "schemafinder.js",
   "bin": {
     "schemafinder": "./schemafinder.js"
   },
-  "scripts": {
-    "test": "jest",
-    "start": "node schemafinder.js"
-  },
-  "keywords": [
-    "graphql",
-    "security",
-    "recon",
-    "audit",
-    "cli"
-  ],
-  "author": "Your Name",
-  "license": "MIT",
   "dependencies": {
     "@babel/parser": "^7.23.3",
     "@babel/traverse": "^7.23.3",
