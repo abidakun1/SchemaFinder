@@ -1,7 +1,7 @@
 # SchemaFinder
 
 
-A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript code files  - optimized for JS auditing and recon. Inspired by [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
+A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript code/files  - optimized for JS auditing and recon. Inspired by [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
 
 
 
