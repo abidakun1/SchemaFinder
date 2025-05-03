@@ -69,8 +69,7 @@ schemafinder -i "src/**/*.js" -o queries.json --postman
 ```
 
 
-6. Introspect a Remote GraphQL Endpoint
-To introspect a remote GraphQL endpoint and extract its schema:
+6. Introspect a Remote GraphQL Endpoint and extract its schema:
 
 ```bash
 schemafinder -o schema.json --introspect "https://example.com/graphql"
