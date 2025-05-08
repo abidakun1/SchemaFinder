@@ -198,6 +198,8 @@ When --postman is used:
 ✅ Generates a complete Postman Collection in Postman v2.1 format (.postman.json) for easy API testing, replaying, or fuzzing.
 
 5. Output
+
+   
 ✅ All extracted queries and mutations are saved in the file specified with -o in JSON format.
 
 ✅ Depending on the flags used, a .postman.json and/or schema.json may also be created.
