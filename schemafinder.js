@@ -9,6 +9,7 @@ const fg = require('fast-glob');
 const fetch = require('node-fetch');
 const cliProgress = require('cli-progress');
 const pLimit = require('p-limit');
+const crypto = require('crypto');
 
 // Configuration
 const DEFAULT_CONCURRENCY = 4;
@@ -24,15 +25,11 @@ program
   .option('-i, --input <pattern>',     'Glob/file/URL for input files')
   .option('-o, --output <file>',       'Output JSON file')
   .option('--postman',                 'Generate Postman collection')
-  .option('--introspect <url>',        'Introspect GraphQL endpoint')
-  .option('--authToken <token>',       'Bearer token for authenticated endpoints')
-  .option('--cookie <cookie>',         'Cookie header for authenticated endpoints')
   .option('--concurrency <n>',         'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
   .option('--verbose',                 'Verbose logging')
   .parse(process.argv);
 
 const options = program.opts();
-
 
 function isRemotePath(p) {
   return /^https?:\/\//.test(p);
@@ -45,8 +42,8 @@ async function fetchRemoteCode(url) {
 }
 
 function validateRequiredVariables() {
-  if (!options.introspect && !options.input) {
-    console.error('❌ Error: You must provide either --input <pattern> or --introspect <url>');
+  if (!options.input) {
+    console.error('❌ Error: You must provide --input <pattern>');
     program.help({ error: true });
   }
 
@@ -64,42 +61,43 @@ function validateRequiredVariables() {
     console.error('❌ Concurrency must be at least 1');
     process.exit(1);
   }
-
-  if (options.introspect && !options.introspect.startsWith('http')) {
-    console.error('❌ Introspection URL must start with http:// or https://');
-    process.exit(1);
-  }
 }
 
 if (!isMainThread) {
   parentPort.on('message', ({ filePath, code }) => {
     const operations = new Map();
 
-    function extractOperation(text, variables = {}) {
-      const matches = [...text.matchAll(GQL_PATTERN)];
-      matches.forEach(match => {
-        const [fullMatch, operationName, args] = match;
-        const signature = fullMatch.replace(/\s+/g, ' ').trim();
+function extractOperation(text, variables = {}) {
+  const matches = [...text.matchAll(GQL_PATTERN)];
+  matches.forEach(match => {
+    let [fullMatch, operationName, args] = match;
 
-        if (args) {
-          args.split(',').forEach(arg => {
-            const [varName, varType] = arg.split(':').map(s => s.trim());
-            if (varName && varType && !variables[varName]) {
-              variables[varName] = getDefaultValue(varType);
-            }
-          });
-        }
+    // Ensure the operation has proper closing brace
+    if (!fullMatch.trim().endsWith('}')) {
+      fullMatch = fullMatch + '}'; // Add missing closing brace
+    }
 
-        if (!operations.has(signature)) {
-          operations.set(signature, {
-            operation: fullMatch.trim(),
-            name: operationName,
-            variables,
-            source: filePath
-          });
+    const signature = fullMatch.replace(/\s+/g, ' ').trim();
+
+    if (args) {
+      args.split(',').forEach(arg => {
+        const [varName, varType] = arg.split(':').map(s => s.trim());
+        if (varName && varType && !variables[varName]) {
+          variables[varName] = getDefaultValue(varType);
         }
       });
     }
+
+    if (!operations.has(signature)) {
+      operations.set(signature, {
+        operation: fullMatch.trim(),
+        name: operationName,
+        variables,
+        source: filePath
+      });
+    }
+  });
+}
 
     function getDefaultValue(type) {
       if (type.includes('String')) return "sample-string";
@@ -329,51 +327,8 @@ function generatePostmanCollection(operations) {
   };
 }
 
-async function introspectEndpoint(url) {
-  const introspectionQuery = { query: `query IntrospectionQuery { __schema { types { name } } }` };
-
-  // start with the required header...
-  const headers = { 'Content-Type': 'application/json' };
-
-  // …add Authorization if they passed --authToken
-  if (options.authToken) {
-    headers['Authorization'] = `Bearer ${options.authToken}`;
-  }
-
-  // …and add Cookie if they passed --cookie
-  if (options.cookie) {
-    headers['Cookie'] = options.cookie;
-  }
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(introspectionQuery),
-    });
-
-    if (!res.ok) {
-      console.error(`❌ Introspection failed: ${res.status} ${res.statusText}`);
-      process.exit(1);
-    }
-
-    const schema = await res.json();
-    fs.writeFileSync(options.output, JSON.stringify(schema, null, 2));
-    console.log(`✅ Introspection saved to ${options.output}`);
-  } catch (err) {
-    console.error('❌ Introspection error:', err.message);
-    process.exit(1);
-  }
-}
-
-
 async function main() {
   validateRequiredVariables();
-
-  if (options.introspect) {
-    await introspectEndpoint(options.introspect);
-    return;
-  }
 
   let filePaths = [];
 
