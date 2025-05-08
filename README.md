@@ -102,11 +102,7 @@ schemafinder -i "src/**/*.js" -o queries.json --postman
 ```
 
 
-6. Introspect a Remote GraphQL Endpoint and extract its schema:
 
-```bash
-schemafinder -o schema.json --introspect "https://example.com/graphql"
-```
 
 
 
@@ -124,11 +120,6 @@ Options:
 
   -o, --output <path>             Output JSON file path for extracted operations
   --postman                       Also export extracted operations as a Postman v2.1 collection
-  --introspect <url>              Introspect a live GraphQL endpoint and save its schema as JSON
-
-  --authToken <token>             (Optional) Bearer token to include in Authorization header when introspecting
-  --cookie <cookie>               (Optional) Cookie header to include when introspecting
-
   --concurrency <number>          (Optional) Max parallel file-processing threads (default: 4)
   --verbose                       (Optional) Enable verbose logging for debug/output details
 
@@ -155,10 +146,6 @@ You can point SchemaFinder at various input sources:
 ✅ Directory or glob pattern:
 
 -i src/**/*.js
-
-✅ Live GraphQL endpoint:
-
---introspect https://api.example.com/graphql
 
 2. File Parsing
 For JavaScript input files:
@@ -202,21 +189,15 @@ Automatically processes .graphql fragments when included via loader.
 
 Uses scope.getBinding() to resolve variables that are assigned GraphQL queries (e.g., const myQuery = "...";).
 
-4. Introspection Support
-When --introspect is used:
 
-✅ Sends an introspection query to the specified GraphQL endpoint using fetch.
-
-✅ Parses and saves the returned schema in .json format.
-
-5. Postman Collection Export
+4. Postman Collection Export
 When --postman is used:
 
 ✅ Wraps each extracted query into a proper Postman request body format.
 
 ✅ Generates a complete Postman Collection in Postman v2.1 format (.postman.json) for easy API testing, replaying, or fuzzing.
 
-6. Output
+5. Output
 ✅ All extracted queries and mutations are saved in the file specified with -o in JSON format.
 
 ✅ Depending on the flags used, a .postman.json and/or schema.json may also be created.
