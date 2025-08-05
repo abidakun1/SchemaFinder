@@ -1,7 +1,6 @@
 # SchemaFinder
 
-
-A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript code/files  - optimized for JS auditing and recon. Inspired by [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
+A Node.js CLI tool for extracting GraphQL operations from JavaScript code, including support for minified/bundled code and remote file analysis.  - optimized for JS auditing and recon. Inspired by [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
 
 
 
@@ -9,39 +8,41 @@ A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript
 
 # Features
 
-✅ Extracts GraphQL Operations from various sources:
-
-- Tagged templates (gql, graphql, apollo, etc.)
-
-- Inline fetch() or HTTP client calls with GraphQL request bodies
-
-- JavaScript string literals and Template literals
-
+✅ **Multi-Source Extraction**:
+- Tagged templates (`gql`, `graphql`, `apollo`)
+- Inline HTTP client calls (`fetch`, `axios`, `request`)
+- JavaScript string literals and template literals
 - Commented-out GraphQL queries
+- Minified/bundled code patterns
+- Escaped GraphQL in JSON-like structures
 
-- Queries built from string concatenation
+✅ **Advanced Minified Code Handling**:
+- Specialized regex patterns for compressed JavaScript
+- Flexible spacing detection in minified operations
+- Template literal content analysis
+- Split operation detection across lines
 
-✅ Efficiently Handles Large Files:
 
-- Streams files to avoid memory exhaustion, even for large files.
 
-✅ Crawl Directories with Glob Patterns:
-
-- Supports directory crawling with customizable glob patterns (e.g., src/**/*.js).
+✅ **Comprehensive Input Support**:
+- Local files and directories (via glob patterns)
+- Remote JavaScript files (URLs)
+- URL lists (batch processing)
+- Large files (streaming support)
 
 ✅ Detects Concatenated Queries:
 
 - Automatically detects and extracts queries built from string concatenation or variables.
 
-✅ Supports Live GraphQL Endpoint Introspection:
-
-- Fetches and saves GraphQL schema from live endpoints with optional authentication headers (Bearer token, Cookie).
 
 ✅ Exports Results in Multiple Formats:
 
-- Outputs extracted queries/mutations as JSON.
+- Outputs extracted queries/mutations as JSON
+- Optionally exports as Postman Collection for API testing
+- Context-aware detection statistics
+- Origin-based operation grouping
+- Detection method classification
 
-- Optionally exports as Postman Collection for API testing.
 
 ✅ Enhanced Performance with Parallel Processing:
 
@@ -63,6 +64,7 @@ A Node.js CLI tool to extract GraphQL queries, mutations schemas from JavaScript
 
 # Installation
 
+
 ```bash
 git clone https://github.com/abidakun1/SchemaFinder.git
 cd SchemaFinder
@@ -80,19 +82,25 @@ npm link   # or use directly via `node schemafinder.js`
 ```bash
 schemafinder -i "src/**/*.js" -o extracted.json
 ```
+2. Batch URL processing:
 
-
-
-2. Extract GraphQL queries from a js file
 
 ```bash
-schemafinder -i file.js -o extracted.json
+schemafinder --url-list urls.txt -o queries.json
 ```
+
 3. Remote File Parsing (Direct URL Input)
 If you want to extract GraphQL queries and mutations directly from a remote JavaScript file, you can provide the URL of the file as input. Here’s how:
 ```bash
 schemafinder -i "https://example.com/path/to/file.js" -o queries.json
 ```
+
+4. Aggressive minified code detection:
+
+```bash
+schemafinder -i "dist/*.min.js" -o queries.json --aggressive
+```
+
 5. Extract and export as a Postman collection
 
 To extract GraphQL schema from JavaScript files and export them as a Postman Collection:
@@ -111,17 +119,15 @@ schemafinder -i "src/**/*.js" -o queries.json --postman
 ```
 
 Options:
-  -h, --help                      Display help for command
-
-  -i, --input <glob|url|file>     Input source(s):
-                                      • Local JS file (e.g. `app.js`)
-                                      • Glob pattern (e.g. `src/**/*.js`)
-                                      • Remote URL (e.g. `https://…/main.js`)
-
-  -o, --output <path>             Output JSON file path for extracted operations
-  --postman                       Also export extracted operations as a Postman v2.1 collection
-  --concurrency <number>          (Optional) Max parallel file-processing threads (default: 4)
-  --verbose                       (Optional) Enable verbose logging for debug/output details
+  -V, --version                   Output tool version
+  -i, --input <pattern>           Glob/file/URL for input files
+  -o, --output <file>             Output JSON file (required)
+  --url-list <file>               Text file containing JS URLs (one per line)
+  --postman                       Generate Postman collection
+  --concurrency <n>               Max parallel files (default: 4)
+  --aggressive                    Use aggressive detection for minified code
+  --verbose                       Verbose logging
+  -h, --help                      Display help
 
 ```
 
@@ -138,6 +144,10 @@ You can point SchemaFinder at various input sources:
 ✅ Single JavaScript file:
 
 -i app.js
+
+✅ Batch URL processing:
+
+--url-list file.txt
 
 ✅ Remote JavaScript file:
 
