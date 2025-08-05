@@ -133,88 +133,6 @@ Options:
 
 
 
-
-
-# How It Works — Step-by-Step
-How It Works — Step-by-Step
-
-1. Input Sources
-You can point SchemaFinder at various input sources:
-
-✅ Single JavaScript file:
-
--i app.js
-
-✅ Batch URL processing:
-
---url-list file.txt
-
-✅ Remote JavaScript file:
-
--i https://example.com/main.js
-
-✅ Directory or glob pattern:
-
--i src/**/*.js
-
-2. File Parsing
-For JavaScript input files:
-
-✅ Recursively scans .js files using fast-glob (supports directories and patterns).
-
-✅ Efficient line-by-line streaming of files for large files, reducing memory usage.
-
-✅ Babel parser (@babel/parser) converts JavaScript code into an Abstract Syntax Tree (AST).
-
-✅ Babel traverse (@babel/traverse) walks through the AST to identify GraphQL-related nodes in the code.
-
-3. GraphQL Detection Logic
-The tool detects GraphQL operations from various sources:
-
-✅ Tagged template literals:
-
-Detects gql, graphql, and similar tagged templates.
-
-✅ fetch() calls:
-
-Detects GraphQL queries in fetch() calls with GraphQL body payloads.
-
-✅ Raw string literals:
-
-Identifies query/mutation strings written directly in JavaScript code.
-
-✅ Template literals or string concatenations:
-
-Detects dynamically built queries using string templates or concatenation.
-
-✅ Inline and block comments:
-
-Detects GraphQL queries embedded in comments (e.g., /* ... */ or // ...).
-
-✅ Imported .graphql fragments:
-
-Automatically processes .graphql fragments when included via loader.
-
-✅ Scope resolution:
-
-Uses scope.getBinding() to resolve variables that are assigned GraphQL queries (e.g., const myQuery = "...";).
-
-
-4. Postman Collection Export
-When --postman is used:
-
-✅ Wraps each extracted query into a proper Postman request body format.
-
-✅ Generates a complete Postman Collection in Postman v2.1 format (.postman.json) for easy API testing, replaying, or fuzzing.
-
-5. Output
-
-   
-✅ All extracted queries and mutations are saved in the file specified with -o in JSON format.
-
-✅ Depending on the flags used, a .postman.json and/or schema.json may also be created.
-
-
 # Summary
 
 
@@ -223,8 +141,6 @@ SchemaFinder acts like a static‑code analysis tool for GraphQL, giving you ful
 ✅ What GraphQL operations exist in your JS code
 Discover every query, mutation, subscription, and fragment embedded in templates, strings, comments or HTTP calls.
 
-✅ The structure of GraphQL schemas
-Introspect live endpoints to pull down complete schema definitions in JSON form.
 
 ✅ How queries and mutations are being constructed
 Trace variable usage, string concatenation, imported fragments, and dynamic template logic via Babel’s AST scope analysis.
