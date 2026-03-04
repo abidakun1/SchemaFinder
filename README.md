@@ -43,11 +43,10 @@ A Node.js CLI tool for extracting GraphQL operations from JavaScript code, inclu
 
 ✅ Exports Results in Multiple Formats:
 
-- Outputs extracted queries/mutations as JSON
-- Optionally exports as Postman Collection for API testing
-- Context-aware detection statistics
-- Origin-based operation grouping
-- Detection method classification
+- Extracted operations as JSON with detection context metadata
+- Optional Postman Collection export for direct API testing
+- Per-origin JSON files grouped in a _sources/ directory
+- Detection method breakdown in summary output
 
 ✅ Advanced Minified Code Handling:
 
