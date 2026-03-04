@@ -2,13 +2,15 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const { Worker, isMainThread, parentPort } = require('worker_threads');
 const { program } = require('commander');
 const parser = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
 const fg = require('fast-glob');
 const fetch = require('node-fetch');
+const { parse: parseGQL, print: printGQL } = require('graphql');
 const cliProgress = require('cli-progress');
 const pLimit = require('p-limit');
 const https = require('https');
@@ -17,32 +19,41 @@ const dns = require('dns');
 // ─── Configuration ────────────────────────────────────────────────────────────
 const DEFAULT_CONCURRENCY = 4;
 const MAX_FILE_SIZE_SYNC = 1024 * 1024; // 1MB
+const FETCH_TIMEOUT_MS = 30_000;
+const FETCH_RETRIES = 3;
+const FETCH_RETRY_BASE_MS = 800;
 
-// ─── GQL Tag names (extended) ─────────────────────────────────────────────────
+// ─── GQL Tag names ────────────────────────────────────────────────────────────
 const GQL_TAGS = new Set([
   'gql', 'graphql', 'apollo', 'loader', 'parse',
-  // Common aliases used after imports like: import gql from 'graphql-tag'
   'gqlTag', 'GraphQL', 'GQL', 'graphqlTag',
 ]);
 
-const HTTP_CLIENTS = new Set(['fetch', 'axios', 'request', 'got', 'superagent', 'ky', '$http', 'http']);
+const HTTP_CLIENTS = new Set([
+  'fetch', 'axios', 'request', 'got', 'superagent', 'ky', '$http', 'http',
+]);
 
-// ─── Core GQL detection: a balanced brace extractor ─────────────────────────
-// This replaces unreliable regex for the full body — we find the opening keyword
-// then walk forward to collect the matching closing brace.
+// ─── GQL validator — confirms candidate is real GQL and normalises whitespace ─
+function validateAndNormalise(raw) {
+  try {
+    return printGQL(parseGQL(raw)).trim();
+  } catch {
+    return null;
+  }
+}
+
+// ─── Balanced brace extractor ─────────────────────────────────────────────────
+// Fresh RegExp every call — avoids lastIndex bleed in concurrent use.
 function extractBalancedGQL(text) {
   const ops = [];
-  // Keywords that start a GQL operation
   const KW_RE = /\b(query|mutation|subscription|fragment)\b/g;
   let m;
   while ((m = KW_RE.exec(text)) !== null) {
     const start = m.index;
-    // Find the opening brace
     const braceStart = text.indexOf('{', start);
     if (braceStart === -1) continue;
 
-    let depth = 0;
-    let end = -1;
+    let depth = 0, end = -1;
     for (let i = braceStart; i < text.length; i++) {
       if (text[i] === '{') depth++;
       else if (text[i] === '}') {
@@ -53,21 +64,17 @@ function extractBalancedGQL(text) {
     if (end === -1) continue;
 
     const raw = text.slice(start, end + 1).trim();
-    if (raw.length < 10) continue; // too short to be real
+    if (raw.length < 10) continue;
 
-    // Extract operation name (may be absent for anonymous)
     const nameMatch = raw.match(/^(?:query|mutation|subscription|fragment)\s+([A-Za-z_][A-Za-z0-9_]*)/);
-    const name = nameMatch ? nameMatch[1] : 'Anonymous';
+    ops.push({ raw, name: nameMatch ? nameMatch[1] : 'Anonymous' });
 
-    ops.push({ raw, name });
-
-    // Advance past this operation to avoid duplicate sub-matches
     KW_RE.lastIndex = end + 1;
   }
   return ops;
 }
 
-// ─── Variable extraction from GQL signature ──────────────────────────────────
+// ─── Variable extraction ──────────────────────────────────────────────────────
 function extractVariablesFromSignature(operation) {
   const variables = {};
   const sigMatch = operation.match(/\(([^)]+)\)/);
@@ -91,22 +98,16 @@ function inferDefaultValue(type) {
 // ─── String decode helpers ────────────────────────────────────────────────────
 function decodeEscapes(str) {
   try {
-    // Handle common escape sequences found in bundled code
     return str
-      .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/\\n/g, '\n')
-      .replace(/\\t/g, '\t')
-      .replace(/\\r/g, '\r')
-      .replace(/\\"/g, '"')
-      .replace(/\\'/g, "'")
-      .replace(/\\\\/g, '\\');
-  } catch {
-    return str;
-  }
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+      .replace(/\\r/g, '\r').replace(/\\"/g, '"')
+      .replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+  } catch { return str; }
 }
 
-// ─── Attempt to decode Base64 strings that look like GQL ─────────────────────
+// ─── Base64 GQL detector ──────────────────────────────────────────────────────
 function tryBase64GQL(str) {
   if (!/^[A-Za-z0-9+/]{20,}={0,2}$/.test(str)) return null;
   try {
@@ -116,25 +117,28 @@ function tryBase64GQL(str) {
   return null;
 }
 
-// ─── Concatenation resolver: `"query " + varName + "{ ... }"` ────────────────
-// Joins adjacent string literals separated by + in the source text
+// ─── Concatenation resolver ───────────────────────────────────────────────────
+// Only merges same-delimiter adjacent strings — avoids corrupting real code.
 function resolveStringConcatenation(code) {
-  // Join "..." + "..." → "......" (simple adjacent string merge for pattern detection)
-  return code.replace(/["'`]\s*\+\s*["'`]/g, '');
+  return code
+    .replace(/'\s*\+\s*'/g, '')
+    .replace(/"\s*\+\s*"/g, '')
+    .replace(/`\s*\+\s*`/g, '');
 }
 
-// ─── The core worker logic ────────────────────────────────────────────────────
+// ─── Worker logic ─────────────────────────────────────────────────────────────
 if (!isMainThread) {
   parentPort.on('message', ({ filePath, code, origin, aggressive, verbose }) => {
     const operations = new Map();
 
     function addOp(raw, name, context, extraVars = {}) {
-      const key = raw.replace(/\s+/g, ' ').trim();
-      if (key.length < 15) return; // not a real operation
-      if (operations.has(key)) return;
+      // Run through real GQL parser — kills false positives, normalises whitespace
+      const normalised = validateAndNormalise(raw);
+      if (!normalised) return;
+      if (operations.has(normalised)) return;
       const variables = { ...extractVariablesFromSignature(raw), ...extraVars };
-      operations.set(key, {
-        operation: raw.trim(),
+      operations.set(normalised, {
+        operation: normalised,
         name: name || 'Anonymous',
         variables,
         source: filePath,
@@ -144,24 +148,19 @@ if (!isMainThread) {
     }
 
     // ── PASS 1: Balanced brace extraction on raw code ─────────────────────
-    const rawOps = extractBalancedGQL(code);
-    rawOps.forEach(({ raw, name }) => addOp(raw, name, 'raw_code'));
+    extractBalancedGQL(code).forEach(({ raw, name }) => addOp(raw, name, 'raw_code'));
 
-    // ── PASS 2: Resolve string concatenations, then re-extract ───────────
+    // ── PASS 2: Resolve string concatenations, re-extract ─────────────────
     const concatResolved = resolveStringConcatenation(code);
     if (concatResolved !== code) {
-      const concatOps = extractBalancedGQL(concatResolved);
-      concatOps.forEach(({ raw, name }) => addOp(raw, name, 'concat_resolved'));
+      extractBalancedGQL(concatResolved).forEach(({ raw, name }) =>
+        addOp(raw, name, 'concat_resolved'));
     }
 
     // ── PASS 3: Extract and decode all string literals ────────────────────
-    // Handles single-quoted, double-quoted, template literals
     const STRING_PATTERNS = [
-      // Double quoted
       /"((?:[^"\\]|\\[\s\S])*)"/g,
-      // Single quoted
       /'((?:[^'\\]|\\[\s\S])*)'/g,
-      // Template literals (backtick) — including multi-line
       /`((?:[^`\\]|\\[\s\S])*)`/g,
     ];
 
@@ -172,9 +171,8 @@ if (!isMainThread) {
         const inner = m[1];
         if (!inner || inner.length < 15) continue;
 
-        // Quick pre-filter
         if (!/\b(query|mutation|subscription|fragment)\b/i.test(inner)) {
-          // Maybe base64?
+          // Base64 only under --aggressive
           if (aggressive) {
             const decoded = tryBase64GQL(inner);
             if (decoded) {
@@ -186,12 +184,9 @@ if (!isMainThread) {
         }
 
         const decoded = decodeEscapes(inner);
-
-        // Direct balanced extraction
         extractBalancedGQL(decoded).forEach(({ raw, name }) =>
           addOp(raw, name, 'string_literal'));
 
-        // Aggressive: also try on collapsed whitespace version
         if (aggressive) {
           const collapsed = decoded.replace(/\s+/g, ' ');
           extractBalancedGQL(collapsed).forEach(({ raw, name }) =>
@@ -200,7 +195,7 @@ if (!isMainThread) {
       }
     }
 
-    // ── PASS 4: AST traversal (most reliable for well-formed code) ────────
+    // ── PASS 4: AST traversal ─────────────────────────────────────────────
     try {
       const ast = parser.parse(code, {
         sourceType: 'unambiguous',
@@ -215,67 +210,54 @@ if (!isMainThread) {
         allowReturnOutsideFunction: true,
         allowUndeclaredExports: true,
         strictMode: false,
-        errorRecovery: true, // ← keeps going despite parse errors
+        errorRecovery: true,
       });
 
       traverse(ast, {
-        // ── Tagged template: gql`...`, graphql`...`
         TaggedTemplateExpression(nodePath) {
           const tag = nodePath.node.tag;
           const tagName =
             tag.name ||
             (tag.property && tag.property.name) ||
             (tag.callee && tag.callee.name);
-
           if (!tagName || !GQL_TAGS.has(tagName)) return;
-
           const text = nodePath.node.quasi.quasis
             .map(q => q.value.cooked || q.value.raw || '')
-            .join('__EXPR__'); // placeholder for interpolated expressions
-
+            .join('__EXPR__');
           extractBalancedGQL(text).forEach(({ raw, name }) =>
             addOp(raw, name, 'tagged_template'));
         },
 
-        // ── String literals in AST (catches things string regex might miss)
         StringLiteral(nodePath) {
           const val = nodePath.node.value;
           if (!val || val.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(val)) return;
-
           extractBalancedGQL(val).forEach(({ raw, name }) =>
             addOp(raw, name, 'ast_string_literal'));
         },
 
-        // ── Template literals not tagged
         TemplateLiteral(nodePath) {
           const text = nodePath.node.quasis
             .map(q => q.value.cooked || q.value.raw || '')
             .join('');
           if (!text || text.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-
           extractBalancedGQL(text).forEach(({ raw, name }) =>
             addOp(raw, name, 'template_literal'));
         },
 
-        // ── Call expressions: fetch/axios/request + useQuery/useMutation etc.
         CallExpression(nodePath) {
           const node = nodePath.node;
           const callee = node.callee;
           const calleeName =
             callee.name ||
-            (callee.property && callee.property.name) ||
-            '';
+            (callee.property && callee.property.name) || '';
 
-          // ── HTTP clients
           if (HTTP_CLIENTS.has(calleeName)) {
             const bodyArg = node.arguments[1];
             if (!bodyArg) return;
-
             const bodyText = extractStringFromNode(bodyArg);
             if (bodyText) {
-              // Could be JSON body
               try {
                 const parsed = JSON.parse(bodyText);
                 const q = parsed.query || parsed.mutation;
@@ -290,82 +272,63 @@ if (!isMainThread) {
             }
           }
 
-          // ── Apollo / React Query hooks: useQuery, useMutation, useSubscription, useLazyQuery
           if (/^use(Query|Mutation|Subscription|LazyQuery)$/.test(calleeName)) {
             const queryArg = node.arguments[0];
             if (queryArg) {
               const text = extractStringFromNode(queryArg);
-              if (text) {
-                extractBalancedGQL(text).forEach(({ raw, name }) =>
-                  addOp(raw, name, `hook_${calleeName}`));
-              }
+              if (text) extractBalancedGQL(text).forEach(({ raw, name }) =>
+                addOp(raw, name, `hook_${calleeName}`));
             }
           }
 
-          // ── client.query({ query: ... }), client.mutate({ mutation: ... })
           if (['query', 'mutate', 'subscribe', 'watchQuery', 'readQuery', 'writeQuery'].includes(calleeName)) {
             const optionsArg = node.arguments[0];
             if (optionsArg && optionsArg.type === 'ObjectExpression') {
               const qProp = optionsArg.properties.find(p =>
                 ['query', 'mutation', 'subscription', 'document'].includes(
-                  (p.key || {}).name || (p.key || {}).value
-                )
-              );
+                  (p.key || {}).name || (p.key || {}).value));
               if (qProp) {
                 const text = extractStringFromNode(qProp.value);
-                if (text) {
-                  extractBalancedGQL(text).forEach(({ raw, name }) =>
-                    addOp(raw, name, `client_${calleeName}`));
-                }
+                if (text) extractBalancedGQL(text).forEach(({ raw, name }) =>
+                  addOp(raw, name, `client_${calleeName}`));
               }
             }
           }
 
-          // ── gql() called as function (not tagged template)
           if (GQL_TAGS.has(calleeName) && node.arguments.length > 0) {
             const text = extractStringFromNode(node.arguments[0]);
-            if (text) {
-              extractBalancedGQL(text).forEach(({ raw, name }) =>
-                addOp(raw, name, 'gql_function_call'));
-            }
+            if (text) extractBalancedGQL(text).forEach(({ raw, name }) =>
+              addOp(raw, name, 'gql_function_call'));
           }
         },
 
-        // ── Object properties: {query: "..."}, {mutation: "..."}
         ObjectProperty(nodePath) {
           const keyName =
             (nodePath.node.key || {}).name ||
             (nodePath.node.key || {}).value;
-
           if (!['query', 'mutation', 'subscription', 'document', 'gql'].includes(keyName)) return;
-
           const text = extractStringFromNode(nodePath.node.value);
-          if (!text) return;
-          if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-
+          if (!text || !/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
           extractBalancedGQL(text).forEach(({ raw, name }) =>
             addOp(raw, name, `object_prop_${keyName}`));
         },
 
-        // ── Assignment: module.exports = "query ..."; window.QUERY = `...`
         AssignmentExpression(nodePath) {
           const right = nodePath.node.right;
           const text = extractStringFromNode(right);
           if (!text || text.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-
           extractBalancedGQL(text).forEach(({ raw, name }) =>
             addOp(raw, name, 'assignment'));
         },
       });
     } catch (astErr) {
-      if (verbose) {
-        parentPort.postMessage({ log: `AST parse error in ${filePath}: ${astErr.message}` });
-      }
-      // AST failed — that's fine, passes 1–3 already ran
+      if (verbose) parentPort.postMessage({
+        log: `[AST] parse error in ${filePath}: ${astErr.message}`,
+      });
     }
 
-    // ── PASS 5: Comment scanning (queries sometimes live in JSDoc / comments)
+    // ── PASS 5: Comment scanning ──────────────────────────────────────────
     const COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
     let cm;
     while ((cm = COMMENT_RE.exec(code)) !== null) {
@@ -374,9 +337,7 @@ if (!isMainThread) {
         addOp(raw, name, 'comment'));
     }
 
-    // ── PASS 6: Webpack chunk / JSON-serialised queries ──────────────────
-    // Some bundlers inline: JSON.stringify({query:"query Foo{...}"})
-    // or window.__APOLLO_STATE__ = {...}
+    // ── PASS 6: Webpack / JSON-serialised queries (aggressive only) ───────
     if (aggressive) {
       const JSON_QUERY_RE = /["']query["']\s*:\s*["'`]((?:[^"'`\\]|\\.)*)["'`]/g;
       let jm;
@@ -396,28 +357,25 @@ if (!isMainThread) {
     parentPort.postMessage({ operations: result, filePath, origin: origin || filePath });
   });
 
-  return; // worker thread ends here
+  return;
 }
 
-// ─── Helper: extract string value from an AST node (best effort) ─────────────
+// ─── AST string extractor ─────────────────────────────────────────────────────
 function extractStringFromNode(node) {
   if (!node) return null;
   if (node.type === 'StringLiteral') return node.value;
-  if (node.type === 'Identifier') return null; // variable reference — can't resolve statically
+  if (node.type === 'Identifier') return null;
   if (node.type === 'TemplateLiteral') {
     return node.quasis.map(q => q.value.cooked || q.value.raw || '').join('');
   }
   if (node.type === 'BinaryExpression' && node.operator === '+') {
-    // "query" + " Foo" + "{ id }"
     const left = extractStringFromNode(node.left);
     const right = extractStringFromNode(node.right);
     if (left !== null && right !== null) return left + right;
-    if (left !== null) return left;
-    if (right !== null) return right;
+    return left ?? right;
   }
   if (node.type === 'TaggedTemplateExpression') {
-    const tag = node.tag;
-    const tagName = tag.name || (tag.property && tag.property.name);
+    const tagName = node.tag.name || (node.tag.property && node.tag.property.name);
     if (GQL_TAGS.has(tagName)) {
       return node.quasi.quasis.map(q => q.value.cooked || '').join('');
     }
@@ -427,21 +385,35 @@ function extractStringFromNode(node) {
 
 // ─── CLI setup ────────────────────────────────────────────────────────────────
 program
-  .version('2.0.0')
-  .option('-i, --input <pattern>',   'Glob/file/URL for input files')
-  .option('-o, --output <file>',     'Output JSON file')
-  .option('--url-list <file>',       'Text file containing JS URLs (one per line)')
-  .option('--postman',               'Generate Postman collection')
-  .option('--concurrency <n>',       'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
-  .option('--aggressive',            'Enable all detection passes (slower but catches more)')
-  .option('--verbose',               'Verbose logging')
+  .version('2.1.0')
+  .option('-i, --input <pattern>',    'Glob/file/URL for input files')
+  .option('-o, --output <file>',      'Output JSON file (required)')
+  .option('--url-list <file>',        'Text file containing JS URLs (one per line)')
+  .option('--postman',                'Generate Postman collection')
+  .option('--concurrency <n>',        'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
+  .option('--aggressive',             'Enable all detection passes (slower, catches more)')
+  .option('--verbose',                'Verbose logging')
+  .option('--headers <json>',         'JSON headers e.g. \'{"Authorization":"Bearer TOKEN","Cookie":"s=abc"}\'')
+  .option('--retries <n>',            'Fetch retry attempts for remote files', parseInt, FETCH_RETRIES)
   .parse(process.argv);
 
 const options = program.opts();
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-function isRemotePath(p) { return /^https?:\/\//.test(p); }
+// ─── Parse --headers once ─────────────────────────────────────────────────────
+let customHeaders = {};
+if (options.headers) {
+  try {
+    customHeaders = JSON.parse(options.headers);
+    if (typeof customHeaders !== 'object' || Array.isArray(customHeaders)) {
+      throw new Error('must be a JSON object');
+    }
+  } catch (e) {
+    console.error(`❌ Invalid --headers value: ${e.message}`);
+    process.exit(1);
+  }
+}
 
+// ─── Validation ───────────────────────────────────────────────────────────────
 function validateRequiredVariables() {
   if (!options.input && !options.urlList) {
     console.error('❌  --input or --url-list is required');
@@ -457,26 +429,46 @@ function validateRequiredVariables() {
   }
 }
 
-async function fetchRemoteCode(url) {
-  console.log(`🔍 Fetching: ${url}`);
+function isRemotePath(p) { return /^https?:\/\//.test(p); }
+
+// ─── Fetch with retry + exponential backoff ───────────────────────────────────
+async function fetchWithRetry(url) {
+  const retries = options.retries ?? FETCH_RETRIES;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
   dns.setDefaultResultOrder('ipv4first');
 
-  const res = await fetch(url, {
-    timeout: 30000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; GQL-Extractor/2.0)',
-      'Accept': 'application/javascript, text/javascript, */*',
-      'Accept-Encoding': 'gzip, deflate',
-    },
-    agent: new https.Agent({ family: 4, timeout: 30000 }),
-  });
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-  const code = await res.text();
-  console.log(`✅ Fetched ${code.length} chars from ${url}`);
-  return code;
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.1)',
+          'Accept': 'application/javascript, text/javascript, */*',
+          'Accept-Encoding': 'gzip, deflate',
+          ...customHeaders,
+        },
+        agent: new https.Agent({ family: 4, timeout: FETCH_TIMEOUT_MS }),
+      });
+      clearTimeout(timer);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      const code = await res.text();
+      if (options.verbose) console.log(`✅ Fetched ${code.length.toLocaleString()} chars — ${url}`);
+      return code;
+    } catch (err) {
+      const isLast = attempt > retries;
+      if (isLast) throw err;
+      const delay = FETCH_RETRY_BASE_MS * Math.pow(2, attempt - 1) + Math.random() * 200;
+      if (options.verbose) console.warn(`⚠️  Attempt ${attempt} failed (${err.message}) — retrying in ${Math.round(delay)}ms`);
+      await sleep(delay);
+    }
+  }
 }
 
+// ─── URL list processor ───────────────────────────────────────────────────────
 async function processUrlList(filePath) {
   const urls = fs.readFileSync(filePath, 'utf8')
     .split('\n')
@@ -486,19 +478,18 @@ async function processUrlList(filePath) {
   if (!urls.length) { console.log('ℹ️  No valid URLs in list'); return []; }
   console.log(`🌐 ${urls.length} URLs to process`);
 
-  const tempDir = path.join(__dirname, '__gql_temp__');
-  fs.mkdirSync(tempDir, { recursive: true });
-
+  // Use os.tmpdir() — never pollute the install directory
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schemafinder-'));
   const limit = pLimit(options.concurrency);
   const entries = [];
 
   await Promise.all(urls.map(url => limit(async () => {
     try {
-      const code = await fetchRemoteCode(url);
+      const code = await fetchWithRetry(url);
       const name = url.replace(/[^a-z0-9]/gi, '_').slice(0, 100) + '.js';
       const fp = path.join(tempDir, name);
       fs.writeFileSync(fp, code);
-      entries.push({ filePath: fp, origin: url });
+      entries.push({ filePath: fp, origin: url, _tempDir: tempDir });
     } catch (e) {
       console.error(`❌ ${url}: ${e.message}`);
     }
@@ -507,7 +498,7 @@ async function processUrlList(filePath) {
   return entries;
 }
 
-// ─── Worker pool manager ──────────────────────────────────────────────────────
+// ─── Worker pool ──────────────────────────────────────────────────────────────
 async function processFiles(fileEntries) {
   if (!fileEntries.length) return [];
 
@@ -520,43 +511,56 @@ async function processFiles(fileEntries) {
   }, cliProgress.Presets.shades_classic);
   bar.start(entries.length, 0);
 
-  const poolSize = Math.min(options.concurrency, entries.length);
   const allOps = new Map();
+  const poolSize = Math.min(options.concurrency, entries.length);
 
-  // Create a proper worker pool with a job queue
-  const idle = []; // idle workers
-  const pending = []; // pending resolve callbacks waiting for a worker
+  // ── Promise-based worker pool — no polling, no race conditions ────────
+  const workerQueue = [];
+  const waitQueue = [];
+  let activeWorkers = 0;
+  let completedJobs = 0;
+  let resolveAll;
+  const allDone = new Promise(r => { resolveAll = r; });
+
+  function releaseWorker(w) {
+    if (waitQueue.length > 0) {
+      waitQueue.shift()(w);
+    } else {
+      workerQueue.push(w);
+    }
+  }
+
+  function acquireWorker() {
+    if (workerQueue.length > 0) return Promise.resolve(workerQueue.pop());
+    if (activeWorkers < poolSize) {
+      activeWorkers++;
+      return Promise.resolve(spawnWorker());
+    }
+    return new Promise(resolve => waitQueue.push(resolve));
+  }
 
   function spawnWorker() {
     const w = new Worker(__filename);
-    w.on('message', ({ operations, log, filePath }) => {
-      if (log && options.verbose) console.log('\n' + log);
+    w.on('message', ({ operations, log }) => {
+      if (log && options.verbose) process.stdout.write('\n' + log + '\n');
       if (operations) {
         operations.forEach(op => {
-          const key = op.operation.replace(/\s+/g, ' ').trim();
-          if (!allOps.has(key)) allOps.set(key, op);
+          if (!allOps.has(op.operation)) allOps.set(op.operation, op);
         });
-      }
-      bar.increment();
-      // Give the worker back
-      if (pending.length > 0) {
-        const next = pending.shift();
-        next(w);
-      } else {
-        idle.push(w);
+        bar.increment();
+        completedJobs++;
+        releaseWorker(w);
+        if (completedJobs === entries.length) resolveAll();
       }
     });
     w.on('error', err => {
-      if (options.verbose) console.error('\nWorker error:', err.message);
+      if (options.verbose) process.stderr.write(`\nWorker error: ${err.message}\n`);
+      bar.increment();
+      completedJobs++;
+      releaseWorker(w);
+      if (completedJobs === entries.length) resolveAll();
     });
     return w;
-  }
-
-  for (let i = 0; i < poolSize; i++) idle.push(spawnWorker());
-
-  function getWorker() {
-    if (idle.length > 0) return Promise.resolve(idle.pop());
-    return new Promise(resolve => pending.push(resolve));
   }
 
   async function readFile(fp) {
@@ -576,14 +580,18 @@ async function processFiles(fileEntries) {
     });
   }
 
-  const limit = pLimit(options.concurrency * 2); // read-ahead
+  const readLimit = pLimit(poolSize * 2);
 
-  await Promise.all(entries.map(entry => limit(async () => {
+  await Promise.all(entries.map(entry => readLimit(async () => {
     let code;
     try { code = await readFile(entry.filePath); }
-    catch { bar.increment(); return; }
-
-    const w = await getWorker();
+    catch {
+      bar.increment();
+      completedJobs++;
+      if (completedJobs === entries.length) resolveAll();
+      return;
+    }
+    const w = await acquireWorker();
     w.postMessage({
       filePath: entry.filePath,
       code,
@@ -591,19 +599,10 @@ async function processFiles(fileEntries) {
       aggressive: !!options.aggressive,
       verbose: !!options.verbose,
     });
-    // worker's 'message' handler above handles completion + recycling
   })));
 
-  // Wait for all workers to finish
-  await new Promise(resolve => {
-    const check = () => {
-      if (idle.length === poolSize) resolve();
-      else setTimeout(check, 50);
-    };
-    check();
-  });
-
-  idle.forEach(w => w.terminate());
+  await allDone;
+  workerQueue.forEach(w => w.terminate());
   bar.stop();
 
   return Array.from(allOps.values());
@@ -613,7 +612,7 @@ async function processFiles(fileEntries) {
 function generatePostmanCollection(operations) {
   return {
     info: {
-      name: 'GraphQL Queries (extracted)',
+      name: 'GraphQL Queries — SchemaFinder',
       schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
     },
     variable: [{ key: 'GRAPHQL_ENDPOINT', value: '', type: 'string' }],
@@ -624,6 +623,8 @@ function generatePostmanCollection(operations) {
         header: [
           { key: 'Content-Type', value: 'application/json' },
           { key: 'Accept',       value: 'application/json' },
+          // Carry through any custom auth headers into every request
+          ...Object.entries(customHeaders).map(([k, v]) => ({ key: k, value: v })),
         ],
         body: {
           mode: 'graphql',
@@ -654,14 +655,17 @@ async function main() {
   validateRequiredVariables();
 
   let fileEntries = [];
+  let tempDir = null;
 
   if (options.urlList) {
     console.log(`📄 Processing URL list: ${options.urlList}`);
     fileEntries = await processUrlList(options.urlList);
+    if (fileEntries.length > 0) tempDir = path.dirname(fileEntries[0].filePath);
   } else if (isRemotePath(options.input)) {
-    console.log(`🌐 Fetching remote file: ${options.input}`);
-    const code = await fetchRemoteCode(options.input);
-    const tmp = path.join(__dirname, '__tmp_remote__.js');
+    console.log(`🌐 Fetching: ${options.input}`);
+    const code = await fetchWithRetry(options.input);
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schemafinder-'));
+    const tmp = path.join(tempDir, '__remote__.js');
     fs.writeFileSync(tmp, code);
     fileEntries = [{ filePath: tmp, origin: options.input }];
   } else {
@@ -677,24 +681,25 @@ async function main() {
     return;
   }
 
-  console.log(`📂 Processing ${fileEntries.length} file(s)`);
-  if (options.aggressive) console.log('🔍 Aggressive mode active');
+  console.log(`📂 Processing ${fileEntries.length} file(s)${options.aggressive ? ' [aggressive mode]' : ''}`);
+  if (Object.keys(customHeaders).length) {
+    console.log(`🔑 Custom headers active: ${Object.keys(customHeaders).join(', ')}`);
+  }
 
   const queries = await processFiles(fileEntries);
 
   if (!queries.length) {
     console.log('ℹ️  No GraphQL operations found.');
-    console.log('💡 Try --aggressive for minified/bundled code.');
+    console.log('💡 Tip: try --aggressive for minified/bundled code.');
     return;
   }
 
-  // ── Output structure ─────────────────────────────────────────────────────
+  // ── Output ───────────────────────────────────────────────────────────────
   const outDir  = path.dirname(options.output);
   const outBase = path.basename(options.output, '.json');
   const srcDir  = path.join(outDir, `${outBase}_sources`);
   fs.mkdirSync(srcDir, { recursive: true });
 
-  // Group by origin
   const byOrigin = {};
   queries.forEach(op => {
     const k = op.origin || 'unknown';
@@ -705,21 +710,19 @@ async function main() {
     fs.writeFileSync(path.join(srcDir, name), JSON.stringify(ops, null, 2));
   });
 
-  // Combined output
   const enriched = queries.map(q => ({
     ...q,
     detectedAt: new Date().toISOString(),
-    toolVersion: '2.0.0',
+    toolVersion: '2.1.0',
   }));
   fs.writeFileSync(options.output, JSON.stringify(enriched, null, 2));
   console.log(`\n✅ ${queries.length} operations → ${options.output}`);
 
-  // Summary
   const ctxSummary = {};
   queries.forEach(q => { ctxSummary[q.context] = (ctxSummary[q.context] || 0) + 1; });
   console.log('\n📊 Detection breakdown:');
   Object.entries(ctxSummary).sort((a, b) => b[1] - a[1]).forEach(([ctx, n]) =>
-    console.log(`   ${ctx.padEnd(30)} ${n}`));
+    console.log(`   ${ctx.padEnd(32)} ${n}`));
 
   if (options.postman) {
     const pmFile = options.output.replace('.json', '.postman.json');
@@ -727,11 +730,10 @@ async function main() {
     console.log(`\n📦 Postman collection → ${pmFile}`);
   }
 
-  // Cleanup temp files
-  const tempDir = path.join(__dirname, '__gql_temp__');
-  if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
-  const tmpRemote = path.join(__dirname, '__tmp_remote__.js');
-  if (fs.existsSync(tmpRemote)) fs.unlinkSync(tmpRemote);
+  // Cleanup — only delete dirs we created in os.tmpdir()
+  if (tempDir && tempDir.startsWith(os.tmpdir())) {
+    try { fs.rmSync(tempDir, { recursive: true }); } catch {}
+  }
 }
 
 main().catch(err => {
