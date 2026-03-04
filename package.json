@@ -1,35 +1,37 @@
 {
-  "name": "graphql-extractor-cli",
-  "version": "2.0.0",
-  "description": "Extract GraphQL operations from JavaScript files — supports minified/bundled code, remote URLs, and batch processing",
+  "name": "schemafinder",
+  "version": "2.1.0",
+  "description": "Find and extract GraphQL operations from JavaScript files and remote endpoints",
   "main": "schemafinder.js",
   "bin": {
     "schemafinder": "./schemafinder.js"
   },
+  "scripts": {
+    "start": "node schemafinder.js"
+  },
+  "keywords": [
+    "graphql",
+    "recon",
+    "security",
+    "bugbounty",
+    "static-analysis",
+    "pentesting",
+    "ast",
+    "extractor"
+  ],
+  "author": "abidakun1",
+  "license": "MIT",
   "dependencies": {
     "@babel/parser": "^7.24.0",
     "@babel/traverse": "^7.24.0",
     "cli-progress": "^3.12.0",
     "commander": "^12.0.0",
     "fast-glob": "^3.3.2",
+    "graphql": "^16.8.1",
     "node-fetch": "^2.7.0",
     "p-limit": "^3.1.0"
   },
-  "devDependencies": {
-    "jest": "^29.7.0"
-  },
-  "keywords": [
-    "graphql",
-    "extractor",
-    "recon",
-    "ast",
-    "security",
-    "cli",
-    "javascript",
-    "minified"
-  ],
   "engines": {
-    "node": ">=16"
-  },
-  "license": "MIT"
+    "node": ">=16.0.0"
+  }
 }
