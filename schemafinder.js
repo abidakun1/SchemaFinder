@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
-const { Worker, isMainThread, parentPort } = require('worker_threads');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const { program } = require('commander');
 const parser = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
@@ -12,719 +14,728 @@ const pLimit = require('p-limit');
 const https = require('https');
 const dns = require('dns');
 
-// Configuration
+// ─── Configuration ────────────────────────────────────────────────────────────
 const DEFAULT_CONCURRENCY = 4;
 const MAX_FILE_SIZE_SYNC = 1024 * 1024; // 1MB
 
-// Enhanced GraphQL patterns for minified code
-const GQL_PATTERN = /(?:query|mutation|subscription|fragment)\s+([a-zA-Z0-9_]+)\s*(?:\(([^)]*)\))?\s*\{[\s\S]*?\}/gs;
-const GQL_TAGS = new Set(['gql', 'graphql', 'apollo']);
-const HTTP_CLIENTS = new Set(['fetch', 'axios', 'request']);
+// ─── GQL Tag names (extended) ─────────────────────────────────────────────────
+const GQL_TAGS = new Set([
+  'gql', 'graphql', 'apollo', 'loader', 'parse',
+  // Common aliases used after imports like: import gql from 'graphql-tag'
+  'gqlTag', 'GraphQL', 'GQL', 'graphqlTag',
+]);
 
-// NEW: Enhanced patterns for minified/bundled code
-const MINIFIED_GQL_PATTERNS = [
-  // Pattern for queries in minified bundles (more flexible spacing)
-  /(?:query|mutation|subscription|fragment)\s*([a-zA-Z0-9_]*)\s*(?:\([^)]*\))?\s*\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}/gs,
+const HTTP_CLIENTS = new Set(['fetch', 'axios', 'request', 'got', 'superagent', 'ky', '$http', 'http']);
 
-  // Pattern for template literal content in strings
-  /"(?:\\.|[^"\\])*(?:query|mutation|subscription|fragment)[^"]*"/gs,
+// ─── Core GQL detection: a balanced brace extractor ─────────────────────────
+// This replaces unreliable regex for the full body — we find the opening keyword
+// then walk forward to collect the matching closing brace.
+function extractBalancedGQL(text) {
+  const ops = [];
+  // Keywords that start a GQL operation
+  const KW_RE = /\b(query|mutation|subscription|fragment)\b/g;
+  let m;
+  while ((m = KW_RE.exec(text)) !== null) {
+    const start = m.index;
+    // Find the opening brace
+    const braceStart = text.indexOf('{', start);
+    if (braceStart === -1) continue;
 
-  // Pattern for escaped GraphQL in JSON-like structures
-  /['"`](?:\\.|[^'"`\\])*(?:query|mutation|subscription|fragment)(?:\\.|[^'"`\\])*['"`]/gs,
+    let depth = 0;
+    let end = -1;
+    for (let i = braceStart; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') {
+        depth--;
+        if (depth === 0) { end = i; break; }
+      }
+    }
+    if (end === -1) continue;
 
-  // Pattern for GraphQL operations split across lines in minified code
-  /(?:query|mutation|subscription|fragment)[\s\S]{0,50}?\{[\s\S]*?\}(?=\s*[,;)\]}])/gs
-];
+    const raw = text.slice(start, end + 1).trim();
+    if (raw.length < 10) continue; // too short to be real
 
-// Pattern to detect potential GraphQL strings
-const POTENTIAL_GQL_STRING = /(?:query|mutation|subscription|fragment|__typename|\bedges\b|\bnode\b|\bpageInfo\b)/i;
+    // Extract operation name (may be absent for anonymous)
+    const nameMatch = raw.match(/^(?:query|mutation|subscription|fragment)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+    const name = nameMatch ? nameMatch[1] : 'Anonymous';
 
+    ops.push({ raw, name });
+
+    // Advance past this operation to avoid duplicate sub-matches
+    KW_RE.lastIndex = end + 1;
+  }
+  return ops;
+}
+
+// ─── Variable extraction from GQL signature ──────────────────────────────────
+function extractVariablesFromSignature(operation) {
+  const variables = {};
+  const sigMatch = operation.match(/\(([^)]+)\)/);
+  if (!sigMatch) return variables;
+  for (const arg of sigMatch[1].split(',')) {
+    const m = arg.match(/\$(\w+)\s*:\s*([\w![\]]+)/);
+    if (m) variables[m[1]] = inferDefaultValue(m[2]);
+  }
+  return variables;
+}
+
+function inferDefaultValue(type) {
+  const t = type.replace(/[!\[\]]/g, '');
+  if (/String|ID|UUID/.test(t)) return 'sample-string';
+  if (/Int|Float|Number/.test(t)) return 0;
+  if (/Boolean/.test(t)) return false;
+  if (/\[/.test(type)) return [];
+  return null;
+}
+
+// ─── String decode helpers ────────────────────────────────────────────────────
+function decodeEscapes(str) {
+  try {
+    // Handle common escape sequences found in bundled code
+    return str
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '\t')
+      .replace(/\\r/g, '\r')
+      .replace(/\\"/g, '"')
+      .replace(/\\'/g, "'")
+      .replace(/\\\\/g, '\\');
+  } catch {
+    return str;
+  }
+}
+
+// ─── Attempt to decode Base64 strings that look like GQL ─────────────────────
+function tryBase64GQL(str) {
+  if (!/^[A-Za-z0-9+/]{20,}={0,2}$/.test(str)) return null;
+  try {
+    const decoded = Buffer.from(str, 'base64').toString('utf8');
+    if (/\b(query|mutation|subscription|fragment)\b/.test(decoded)) return decoded;
+  } catch {}
+  return null;
+}
+
+// ─── Concatenation resolver: `"query " + varName + "{ ... }"` ────────────────
+// Joins adjacent string literals separated by + in the source text
+function resolveStringConcatenation(code) {
+  // Join "..." + "..." → "......" (simple adjacent string merge for pattern detection)
+  return code.replace(/["'`]\s*\+\s*["'`]/g, '');
+}
+
+// ─── The core worker logic ────────────────────────────────────────────────────
+if (!isMainThread) {
+  parentPort.on('message', ({ filePath, code, origin, aggressive, verbose }) => {
+    const operations = new Map();
+
+    function addOp(raw, name, context, extraVars = {}) {
+      const key = raw.replace(/\s+/g, ' ').trim();
+      if (key.length < 15) return; // not a real operation
+      if (operations.has(key)) return;
+      const variables = { ...extractVariablesFromSignature(raw), ...extraVars };
+      operations.set(key, {
+        operation: raw.trim(),
+        name: name || 'Anonymous',
+        variables,
+        source: filePath,
+        origin: origin || filePath,
+        context,
+      });
+    }
+
+    // ── PASS 1: Balanced brace extraction on raw code ─────────────────────
+    const rawOps = extractBalancedGQL(code);
+    rawOps.forEach(({ raw, name }) => addOp(raw, name, 'raw_code'));
+
+    // ── PASS 2: Resolve string concatenations, then re-extract ───────────
+    const concatResolved = resolveStringConcatenation(code);
+    if (concatResolved !== code) {
+      const concatOps = extractBalancedGQL(concatResolved);
+      concatOps.forEach(({ raw, name }) => addOp(raw, name, 'concat_resolved'));
+    }
+
+    // ── PASS 3: Extract and decode all string literals ────────────────────
+    // Handles single-quoted, double-quoted, template literals
+    const STRING_PATTERNS = [
+      // Double quoted
+      /"((?:[^"\\]|\\[\s\S])*)"/g,
+      // Single quoted
+      /'((?:[^'\\]|\\[\s\S])*)'/g,
+      // Template literals (backtick) — including multi-line
+      /`((?:[^`\\]|\\[\s\S])*)`/g,
+    ];
+
+    for (const pattern of STRING_PATTERNS) {
+      let m;
+      pattern.lastIndex = 0;
+      while ((m = pattern.exec(code)) !== null) {
+        const inner = m[1];
+        if (!inner || inner.length < 15) continue;
+
+        // Quick pre-filter
+        if (!/\b(query|mutation|subscription|fragment)\b/i.test(inner)) {
+          // Maybe base64?
+          if (aggressive) {
+            const decoded = tryBase64GQL(inner);
+            if (decoded) {
+              extractBalancedGQL(decoded).forEach(({ raw, name }) =>
+                addOp(raw, name, 'base64_decoded'));
+            }
+          }
+          continue;
+        }
+
+        const decoded = decodeEscapes(inner);
+
+        // Direct balanced extraction
+        extractBalancedGQL(decoded).forEach(({ raw, name }) =>
+          addOp(raw, name, 'string_literal'));
+
+        // Aggressive: also try on collapsed whitespace version
+        if (aggressive) {
+          const collapsed = decoded.replace(/\s+/g, ' ');
+          extractBalancedGQL(collapsed).forEach(({ raw, name }) =>
+            addOp(raw, name, 'string_collapsed'));
+        }
+      }
+    }
+
+    // ── PASS 4: AST traversal (most reliable for well-formed code) ────────
+    try {
+      const ast = parser.parse(code, {
+        sourceType: 'unambiguous',
+        plugins: [
+          'jsx', 'typescript', 'classProperties', 'dynamicImport',
+          'optionalChaining', 'nullishCoalescingOperator',
+          'decorators-legacy', 'classPrivateProperties',
+        ],
+        tokens: false,
+        allowImportExportEverywhere: true,
+        allowAwaitOutsideFunction: true,
+        allowReturnOutsideFunction: true,
+        allowUndeclaredExports: true,
+        strictMode: false,
+        errorRecovery: true, // ← keeps going despite parse errors
+      });
+
+      traverse(ast, {
+        // ── Tagged template: gql`...`, graphql`...`
+        TaggedTemplateExpression(nodePath) {
+          const tag = nodePath.node.tag;
+          const tagName =
+            tag.name ||
+            (tag.property && tag.property.name) ||
+            (tag.callee && tag.callee.name);
+
+          if (!tagName || !GQL_TAGS.has(tagName)) return;
+
+          const text = nodePath.node.quasi.quasis
+            .map(q => q.value.cooked || q.value.raw || '')
+            .join('__EXPR__'); // placeholder for interpolated expressions
+
+          extractBalancedGQL(text).forEach(({ raw, name }) =>
+            addOp(raw, name, 'tagged_template'));
+        },
+
+        // ── String literals in AST (catches things string regex might miss)
+        StringLiteral(nodePath) {
+          const val = nodePath.node.value;
+          if (!val || val.length < 15) return;
+          if (!/\b(query|mutation|subscription|fragment)\b/i.test(val)) return;
+
+          extractBalancedGQL(val).forEach(({ raw, name }) =>
+            addOp(raw, name, 'ast_string_literal'));
+        },
+
+        // ── Template literals not tagged
+        TemplateLiteral(nodePath) {
+          const text = nodePath.node.quasis
+            .map(q => q.value.cooked || q.value.raw || '')
+            .join('');
+          if (!text || text.length < 15) return;
+          if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
+
+          extractBalancedGQL(text).forEach(({ raw, name }) =>
+            addOp(raw, name, 'template_literal'));
+        },
+
+        // ── Call expressions: fetch/axios/request + useQuery/useMutation etc.
+        CallExpression(nodePath) {
+          const node = nodePath.node;
+          const callee = node.callee;
+          const calleeName =
+            callee.name ||
+            (callee.property && callee.property.name) ||
+            '';
+
+          // ── HTTP clients
+          if (HTTP_CLIENTS.has(calleeName)) {
+            const bodyArg = node.arguments[1];
+            if (!bodyArg) return;
+
+            const bodyText = extractStringFromNode(bodyArg);
+            if (bodyText) {
+              // Could be JSON body
+              try {
+                const parsed = JSON.parse(bodyText);
+                const q = parsed.query || parsed.mutation;
+                if (q) {
+                  extractBalancedGQL(q).forEach(({ raw, name }) =>
+                    addOp(raw, name, 'http_client_json', parsed.variables || {}));
+                }
+              } catch {
+                extractBalancedGQL(bodyText).forEach(({ raw, name }) =>
+                  addOp(raw, name, 'http_client_body'));
+              }
+            }
+          }
+
+          // ── Apollo / React Query hooks: useQuery, useMutation, useSubscription, useLazyQuery
+          if (/^use(Query|Mutation|Subscription|LazyQuery)$/.test(calleeName)) {
+            const queryArg = node.arguments[0];
+            if (queryArg) {
+              const text = extractStringFromNode(queryArg);
+              if (text) {
+                extractBalancedGQL(text).forEach(({ raw, name }) =>
+                  addOp(raw, name, `hook_${calleeName}`));
+              }
+            }
+          }
+
+          // ── client.query({ query: ... }), client.mutate({ mutation: ... })
+          if (['query', 'mutate', 'subscribe', 'watchQuery', 'readQuery', 'writeQuery'].includes(calleeName)) {
+            const optionsArg = node.arguments[0];
+            if (optionsArg && optionsArg.type === 'ObjectExpression') {
+              const qProp = optionsArg.properties.find(p =>
+                ['query', 'mutation', 'subscription', 'document'].includes(
+                  (p.key || {}).name || (p.key || {}).value
+                )
+              );
+              if (qProp) {
+                const text = extractStringFromNode(qProp.value);
+                if (text) {
+                  extractBalancedGQL(text).forEach(({ raw, name }) =>
+                    addOp(raw, name, `client_${calleeName}`));
+                }
+              }
+            }
+          }
+
+          // ── gql() called as function (not tagged template)
+          if (GQL_TAGS.has(calleeName) && node.arguments.length > 0) {
+            const text = extractStringFromNode(node.arguments[0]);
+            if (text) {
+              extractBalancedGQL(text).forEach(({ raw, name }) =>
+                addOp(raw, name, 'gql_function_call'));
+            }
+          }
+        },
+
+        // ── Object properties: {query: "..."}, {mutation: "..."}
+        ObjectProperty(nodePath) {
+          const keyName =
+            (nodePath.node.key || {}).name ||
+            (nodePath.node.key || {}).value;
+
+          if (!['query', 'mutation', 'subscription', 'document', 'gql'].includes(keyName)) return;
+
+          const text = extractStringFromNode(nodePath.node.value);
+          if (!text) return;
+          if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
+
+          extractBalancedGQL(text).forEach(({ raw, name }) =>
+            addOp(raw, name, `object_prop_${keyName}`));
+        },
+
+        // ── Assignment: module.exports = "query ..."; window.QUERY = `...`
+        AssignmentExpression(nodePath) {
+          const right = nodePath.node.right;
+          const text = extractStringFromNode(right);
+          if (!text || text.length < 15) return;
+          if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
+
+          extractBalancedGQL(text).forEach(({ raw, name }) =>
+            addOp(raw, name, 'assignment'));
+        },
+      });
+    } catch (astErr) {
+      if (verbose) {
+        parentPort.postMessage({ log: `AST parse error in ${filePath}: ${astErr.message}` });
+      }
+      // AST failed — that's fine, passes 1–3 already ran
+    }
+
+    // ── PASS 5: Comment scanning (queries sometimes live in JSDoc / comments)
+    const COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
+    let cm;
+    while ((cm = COMMENT_RE.exec(code)) !== null) {
+      const cleaned = cm[0].replace(/^\/\*+|\*+\/$/g, '').replace(/^\/\/\s*/gm, '');
+      extractBalancedGQL(cleaned).forEach(({ raw, name }) =>
+        addOp(raw, name, 'comment'));
+    }
+
+    // ── PASS 6: Webpack chunk / JSON-serialised queries ──────────────────
+    // Some bundlers inline: JSON.stringify({query:"query Foo{...}"})
+    // or window.__APOLLO_STATE__ = {...}
+    if (aggressive) {
+      const JSON_QUERY_RE = /["']query["']\s*:\s*["'`]((?:[^"'`\\]|\\.)*)["'`]/g;
+      let jm;
+      while ((jm = JSON_QUERY_RE.exec(code)) !== null) {
+        const val = decodeEscapes(jm[1]);
+        if (/\b(query|mutation|subscription|fragment)\b/i.test(val)) {
+          extractBalancedGQL(val).forEach(({ raw, name }) =>
+            addOp(raw, name, 'inline_json_query'));
+        }
+      }
+    }
+
+    const result = Array.from(operations.values());
+    if (verbose && result.length > 0) {
+      parentPort.postMessage({ log: `[${filePath}] Found ${result.length} operations` });
+    }
+    parentPort.postMessage({ operations: result, filePath, origin: origin || filePath });
+  });
+
+  return; // worker thread ends here
+}
+
+// ─── Helper: extract string value from an AST node (best effort) ─────────────
+function extractStringFromNode(node) {
+  if (!node) return null;
+  if (node.type === 'StringLiteral') return node.value;
+  if (node.type === 'Identifier') return null; // variable reference — can't resolve statically
+  if (node.type === 'TemplateLiteral') {
+    return node.quasis.map(q => q.value.cooked || q.value.raw || '').join('');
+  }
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    // "query" + " Foo" + "{ id }"
+    const left = extractStringFromNode(node.left);
+    const right = extractStringFromNode(node.right);
+    if (left !== null && right !== null) return left + right;
+    if (left !== null) return left;
+    if (right !== null) return right;
+  }
+  if (node.type === 'TaggedTemplateExpression') {
+    const tag = node.tag;
+    const tagName = tag.name || (tag.property && tag.property.name);
+    if (GQL_TAGS.has(tagName)) {
+      return node.quasi.quasis.map(q => q.value.cooked || '').join('');
+    }
+  }
+  return null;
+}
+
+// ─── CLI setup ────────────────────────────────────────────────────────────────
 program
-  .version('1.3.0')
-  .option('-i, --input <pattern>',     'Glob/file/URL for input files')
-  .option('-o, --output <file>',       'Output JSON file')
-  .option('--url-list <file>',         'Text file containing JS URLs (one per line)')
-  .option('--postman',                 'Generate Postman collection')
-  .option('--concurrency <n>',         'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
-  .option('--aggressive',              'Use aggressive detection for minified code')
-  .option('--verbose',                 'Verbose logging')
+  .version('2.0.0')
+  .option('-i, --input <pattern>',   'Glob/file/URL for input files')
+  .option('-o, --output <file>',     'Output JSON file')
+  .option('--url-list <file>',       'Text file containing JS URLs (one per line)')
+  .option('--postman',               'Generate Postman collection')
+  .option('--concurrency <n>',       'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
+  .option('--aggressive',            'Enable all detection passes (slower but catches more)')
+  .option('--verbose',               'Verbose logging')
   .parse(process.argv);
 
 const options = program.opts();
 
-function isRemotePath(p) {
-  return /^https?:\/\//.test(p);
-}
-
-async function fetchRemoteCode(url) {
-  console.log(`🔍 Attempting to fetch: ${url}`);
-
-  // Force IPv4 to avoid IPv6 connectivity issues
-  dns.setDefaultResultOrder('ipv4first');
-
-  const fetchOptions = {
-    timeout: 30000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; GraphQL-Extractor/1.3.0)',
-      'Accept': 'application/javascript, text/javascript, */*',
-      'Accept-Encoding': 'gzip, deflate',
-      'Accept-Language': 'en-US,en;q=0.9'
-    },
-    // Force IPv4 agent
-    agent: new https.Agent({
-      family: 4, // IPv4 only
-      timeout: 30000
-    })
-  };
-
-  try {
-    const res = await fetch(url, fetchOptions);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-
-    const code = await res.text();
-    console.log(`✅ Successfully fetched ${code.length} characters`);
-    return code;
-  } catch (error) {
-    console.error(`❌ Fetch failed: ${error.message}`);
-    if (error.code === 'ENETUNREACH' || error.code === 'ENOTFOUND') {
-      console.log(`💡 Network issue detected. This is likely an IPv6 connectivity problem.`);
-    }
-    throw error;
-  }
-}
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function isRemotePath(p) { return /^https?:\/\//.test(p); }
 
 function validateRequiredVariables() {
   if (!options.input && !options.urlList) {
-    console.error('❌ Error: You must provide either --input or --url-list');
+    console.error('❌  --input or --url-list is required');
     program.help({ error: true });
   }
-
   if (!options.output || typeof options.output !== 'string') {
-    console.error('❌ Error: --output <file> is required');
+    console.error('❌  --output <file> is required');
     program.help({ error: true });
   }
-
-  if (isNaN(options.concurrency)) {
-    console.error('❌ Concurrency must be a number');
-    process.exit(1);
-  }
-
-  if (options.concurrency < 1) {
-    console.error('❌ Concurrency must be at least 1');
+  if (isNaN(options.concurrency) || options.concurrency < 1) {
+    console.error('❌  --concurrency must be a positive integer');
     process.exit(1);
   }
 }
 
-//  Process URL list file
+async function fetchRemoteCode(url) {
+  console.log(`🔍 Fetching: ${url}`);
+  dns.setDefaultResultOrder('ipv4first');
+
+  const res = await fetch(url, {
+    timeout: 30000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; GQL-Extractor/2.0)',
+      'Accept': 'application/javascript, text/javascript, */*',
+      'Accept-Encoding': 'gzip, deflate',
+    },
+    agent: new https.Agent({ family: 4, timeout: 30000 }),
+  });
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+  const code = await res.text();
+  console.log(`✅ Fetched ${code.length} chars from ${url}`);
+  return code;
+}
+
 async function processUrlList(filePath) {
-  const content = fs.readFileSync(filePath, 'utf8');
-  const urls = content.split('\n')
-    .map(line => line.trim())
-    .filter(line => line && !line.startsWith('#') && isRemotePath(line));
+  const urls = fs.readFileSync(filePath, 'utf8')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#') && isRemotePath(l));
 
-  if (!urls.length) {
-    console.log('ℹ️ No valid URLs found in the list');
-    return [];
-  }
+  if (!urls.length) { console.log('ℹ️  No valid URLs in list'); return []; }
+  console.log(`🌐 ${urls.length} URLs to process`);
 
-  console.log(`🌐 Found ${urls.length} URLs to process`);
-
-  // Create a temporary directory for downloaded files
-  const tempDir = path.join(__dirname, 'url_analysis_temp');
+  const tempDir = path.join(__dirname, '__gql_temp__');
   fs.mkdirSync(tempDir, { recursive: true });
 
   const limit = pLimit(options.concurrency);
-  const results = [];
+  const entries = [];
 
-  for (const url of urls) {
-    await limit(async () => {
-      try {
-        const code = await fetchRemoteCode(url);
-        const safeFilename = url.replace(/[^a-z0-9]/gi, '_').slice(0, 100) + '.js';
-        const filePath = path.join(tempDir, safeFilename);
-        fs.writeFileSync(filePath, code);
-        results.push({ filePath, origin: url });
-      } catch (error) {
-        console.error(`❌ Failed to process ${url}: ${error.message}`);
+  await Promise.all(urls.map(url => limit(async () => {
+    try {
+      const code = await fetchRemoteCode(url);
+      const name = url.replace(/[^a-z0-9]/gi, '_').slice(0, 100) + '.js';
+      const fp = path.join(tempDir, name);
+      fs.writeFileSync(fp, code);
+      entries.push({ filePath: fp, origin: url });
+    } catch (e) {
+      console.error(`❌ ${url}: ${e.message}`);
+    }
+  })));
+
+  return entries;
+}
+
+// ─── Worker pool manager ──────────────────────────────────────────────────────
+async function processFiles(fileEntries) {
+  if (!fileEntries.length) return [];
+
+  const entries = fileEntries.map(e =>
+    typeof e === 'string' ? { filePath: e, origin: e } : e);
+
+  const bar = new cliProgress.SingleBar({
+    format: '🚀 {bar} | {percentage}% | {value}/{total} files | ETA: {eta}s',
+    hideCursor: true,
+  }, cliProgress.Presets.shades_classic);
+  bar.start(entries.length, 0);
+
+  const poolSize = Math.min(options.concurrency, entries.length);
+  const allOps = new Map();
+
+  // Create a proper worker pool with a job queue
+  const idle = []; // idle workers
+  const pending = []; // pending resolve callbacks waiting for a worker
+
+  function spawnWorker() {
+    const w = new Worker(__filename);
+    w.on('message', ({ operations, log, filePath }) => {
+      if (log && options.verbose) console.log('\n' + log);
+      if (operations) {
+        operations.forEach(op => {
+          const key = op.operation.replace(/\s+/g, ' ').trim();
+          if (!allOps.has(key)) allOps.set(key, op);
+        });
       }
+      bar.increment();
+      // Give the worker back
+      if (pending.length > 0) {
+        const next = pending.shift();
+        next(w);
+      } else {
+        idle.push(w);
+      }
+    });
+    w.on('error', err => {
+      if (options.verbose) console.error('\nWorker error:', err.message);
+    });
+    return w;
+  }
+
+  for (let i = 0; i < poolSize; i++) idle.push(spawnWorker());
+
+  function getWorker() {
+    if (idle.length > 0) return Promise.resolve(idle.pop());
+    return new Promise(resolve => pending.push(resolve));
+  }
+
+  async function readFile(fp) {
+    return new Promise((resolve, reject) => {
+      fs.stat(fp, (err, stats) => {
+        if (err) { reject(err); return; }
+        if (stats.size > MAX_FILE_SIZE_SYNC) {
+          const chunks = [];
+          fs.createReadStream(fp)
+            .on('data', c => chunks.push(c))
+            .on('end', () => resolve(Buffer.concat(chunks).toString()))
+            .on('error', reject);
+        } else {
+          fs.readFile(fp, 'utf8', (e, d) => e ? reject(e) : resolve(d));
+        }
+      });
     });
   }
 
-  return results;
-}
+  const limit = pLimit(options.concurrency * 2); // read-ahead
 
-if (!isMainThread) {
-  parentPort.on('message', ({ filePath, code, origin }) => {
-    const operations = new Map();
-    const detectedStrings = new Set();
+  await Promise.all(entries.map(entry => limit(async () => {
+    let code;
+    try { code = await readFile(entry.filePath); }
+    catch { bar.increment(); return; }
 
-    function detectGraphQLInString(str, context = 'unknown') {
-      if (!str || typeof str !== 'string') return [];
-
-      const found = [];
-
-      if (POTENTIAL_GQL_STRING.test(str)) {
-        let cleaned = str
-          .replace(/\\n/g, '\n')
-          .replace(/\\t/g, ' ')
-          .replace(/\\"/g, '"')
-          .replace(/\\'/g, "'")
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        const gqlMatches = [...cleaned.matchAll(GQL_PATTERN)];
-        if (gqlMatches.length > 0) {
-          gqlMatches.forEach(match => found.push({
-            operation: match[0],
-            name: match[1] || 'Anonymous',
-            context: context
-          }));
-        } else if (options.aggressive) {
-          MINIFIED_GQL_PATTERNS.forEach(pattern => {
-            const matches = [...cleaned.matchAll(pattern)];
-            matches.forEach(match => {
-              const operation = match[0];
-              if (operation.length > 20 && !detectedStrings.has(operation)) {
-                detectedStrings.add(operation);
-                found.push({
-                  operation: operation,
-                  name: extractOperationName(operation) || 'MinifiedOperation',
-                  context: `${context}_minified`
-                });
-              }
-            });
-          });
-        }
-      }
-
-      return found;
-    }
-
-    function extractOperationName(gqlString) {
-      const nameMatch = gqlString.match(/(?:query|mutation|subscription|fragment)\s+([a-zA-Z0-9_]+)/);
-      return nameMatch ? nameMatch[1] : null;
-    }
-
-    function analyzeStringLiterals(code) {
-      const stringPatterns = [
-        /"(?:\\.|[^"\\])*"/g,
-        /'(?:\\.|[^'\\])*'/g,
-        /`(?:\\.|[^`\\])*`/g
-      ];
-
-      stringPatterns.forEach(pattern => {
-        const matches = [...code.matchAll(pattern)];
-        matches.forEach(match => {
-          const str = match[0].slice(1, -1);
-          const found = detectGraphQLInString(str, 'string_literal');
-          found.forEach(item => {
-            const signature = item.operation.replace(/\s+/g, ' ').trim();
-            if (!operations.has(signature)) {
-              operations.set(signature, {
-                operation: item.operation,
-                name: item.name,
-                variables: extractVariablesFromOperation(item.operation),
-                source: filePath,
-                origin: origin || filePath,
-                context: item.context
-              });
-            }
-          });
-        });
-      });
-    }
-
-    function extractVariablesFromOperation(operation) {
-      const variables = {};
-
-      const signatureMatch = operation.match(/\(([^)]*)\)/);
-      if (signatureMatch) {
-        const args = signatureMatch[1];
-        args.split(',').forEach(arg => {
-          const match = arg.match(/\$(\w+):\s*(\w+[!\[\]]*)/);
-          if (match) {
-            const [, varName, varType] = match;
-            variables[varName] = getDefaultValue(varType);
-          }
-        });
-      }
-
-      return variables;
-    }
-
-    function extractOperation(text, variables = {}) {
-      const matches = [...text.matchAll(GQL_PATTERN)];
-      matches.forEach(match => {
-        let [fullMatch, operationName, args] = match;
-
-        if (!fullMatch.trim().endsWith('}')) {
-          fullMatch = fullMatch + '}';
-        }
-
-        const signature = fullMatch.replace(/\s+/g, ' ').trim();
-
-        if (args) {
-          args.split(',').forEach(arg => {
-            const [varName, varType] = arg.split(':').map(s => s.trim());
-            if (varName && varType && !variables[varName]) {
-              variables[varName] = getDefaultValue(varType);
-            }
-          });
-        }
-
-        if (!operations.has(signature)) {
-          operations.set(signature, {
-            operation: fullMatch.trim(),
-            name: operationName,
-            variables,
-            source: filePath,
-            origin: origin || filePath,
-            context: 'standard'
-          });
-        }
-      });
-    }
-
-    function getDefaultValue(type) {
-      if (type.includes('String')) return "sample-string";
-      if (type.includes('Int') || type.includes('Float')) return 0;
-      if (type.includes('Boolean')) return false;
-      if (type.includes('ID')) return "123";
-      if (type.includes('[')) return [];
-      return null;
-    }
-
-    function extractFromComments(code) {
-      const patterns = [
-        /\/\*[\s\S]*?\*\//g,
-        /\/\/.*$/gm
-      ];
-
-      patterns.forEach(pattern => {
-        const comments = code.match(pattern) || [];
-        comments.forEach(comment => {
-          const cleaned = comment
-            .replace(/^\/\*+|\*+\/$/g, '')
-            .replace(/^\/\/\s*/gm, '')
-            .trim();
-          extractOperation(cleaned);
-        });
-      });
-    }
-
-    function extractVariablesFromCode(node) {
-      const variables = {};
-      if (node.type === 'ObjectExpression') {
-        node.properties.forEach(prop => {
-          if (prop.key.name === 'variables' || prop.key.value === 'variables') {
-            if (prop.value.type === 'ObjectExpression') {
-              prop.value.properties.forEach(varProp => {
-                if (varProp.value.type === 'Literal') {
-                  variables[varProp.key.name || varProp.key.value] = varProp.value.value;
-                }
-              });
-            }
-          }
-        });
-      }
-      return variables;
-    }
-
-    try {
-      const isLikelyMinified = code.length > 10000 && code.split('\n').length < 50;
-      if (options.verbose && isLikelyMinified) {
-        parentPort.postMessage({
-          error: `Detected likely minified file: ${filePath}, using enhanced detection`
-        });
-      }
-
-      extractFromComments(code);
-
-      if (options.aggressive || isLikelyMinified) {
-        analyzeStringLiterals(code);
-      }
-
-      if (options.aggressive) {
-        MINIFIED_GQL_PATTERNS.forEach((pattern, index) => {
-          const matches = [...code.matchAll(pattern)];
-          matches.forEach(match => {
-            const operation = match[0];
-            if (operation.length > 30 && !detectedStrings.has(operation)) {
-              detectedStrings.add(operation);
-              const signature = operation.replace(/\s+/g, ' ').trim();
-              if (!operations.has(signature)) {
-                operations.set(signature, {
-                  operation: operation,
-                  name: extractOperationName(operation) || `Pattern${index}_Operation`,
-                  variables: extractVariablesFromOperation(operation),
-                  source: filePath,
-                  origin: origin || filePath,
-                  context: `pattern_${index}`
-                });
-              }
-            }
-          });
-        });
-      }
-
-      try {
-        const ast = parser.parse(code, {
-          sourceType: 'unambiguous',
-          plugins: ['jsx', 'typescript', 'classProperties', 'dynamicImport'],
-          tokens: true,
-          allowImportExportEverywhere: true,
-          allowAwaitOutsideFunction: true,
-          allowReturnOutsideFunction: true,
-          allowUndeclaredExports: true,
-          strictMode: false
-        });
-
-        traverse(ast, {
-          StringLiteral(path) {
-            if (options.aggressive && path.node.value) {
-              const found = detectGraphQLInString(path.node.value, 'ast_string');
-              found.forEach(item => {
-                const signature = item.operation.replace(/\s+/g, ' ').trim();
-                if (!operations.has(signature)) {
-                  operations.set(signature, {
-                    operation: item.operation,
-                    name: item.name,
-                    variables: extractVariablesFromOperation(item.operation),
-                    source: filePath,
-                    origin: origin || filePath,
-                    context: item.context
-                  });
-                }
-              });
-            }
-          },
-
-          TaggedTemplateExpression(path) {
-            if (GQL_TAGS.has(path.node.tag.name)) {
-              const text = path.node.quasi.quasis.map(q => q.value.cooked).join('');
-              extractOperation(text);
-            }
-          },
-
-          CallExpression(path) {
-            const callee = path.node.callee;
-            const calleeName = callee.name || (callee.property && callee.property.name) || '';
-            if (HTTP_CLIENTS.has(calleeName)) {
-              const args = path.node.arguments;
-              if (args.length < 2) return;
-
-              const configArg = args[1];
-              if (!configArg || configArg.type !== 'ObjectExpression') return;
-
-              const bodyProp = configArg.properties.find(p =>
-                ['body', 'data'].includes(p.key.name || p.key.value)
-              );
-
-              if (bodyProp) {
-                let bodyText = '';
-                let variables = extractVariablesFromCode(configArg);
-
-                if (bodyProp.value.type === 'StringLiteral') {
-                  bodyText = bodyProp.value.value;
-                } else if (bodyProp.value.type === 'TemplateLiteral') {
-                  bodyText = bodyProp.value.quasis.map(q => q.value.cooked).join('');
-                } else if (bodyProp.value.type === 'ObjectExpression') {
-                  const queryProp = bodyProp.value.properties.find(p =>
-                    ['query', 'mutation'].includes(p.key.name || p.key.value)
-                  );
-                  if (queryProp) {
-                    if (queryProp.value.type === 'StringLiteral') {
-                      bodyText = queryProp.value.value;
-                    } else if (queryProp.value.type === 'TemplateLiteral') {
-                      bodyText = queryProp.value.quasis.map(q => q.value.cooked).join('');
-                    }
-                  }
-                }
-
-                try {
-                  const json = JSON.parse(bodyText);
-                  if (json.query) {
-                    extractOperation(json.query, json.variables || variables);
-                  }
-                } catch {
-                  extractOperation(bodyText, variables);
-                }
-              }
-            }
-          },
-
-          VariableDeclarator(path) {
-            if (path.node.init && path.node.init.type === 'TaggedTemplateExpression') {
-              const tag = path.node.init.tag.name;
-              if (GQL_TAGS.has(tag)) {
-                const text = path.node.init.quasi.quasis.map(q => q.value.cooked).join('');
-                extractOperation(text);
-              }
-            }
-          }
-        });
-      } catch (astError) {
-        if (options.verbose) {
-          parentPort.postMessage({
-            error: `AST parsing failed for ${filePath}, continuing with pattern matching: ${astError.message}`
-          });
-        }
-      }
-    } catch (error) {
-      if (options.verbose) {
-        parentPort.postMessage({ error: `Error processing ${filePath}: ${error.message}` });
-      }
-    }
-
-    const operationsArray = Array.from(operations.values());
-    if (options.verbose && operationsArray.length > 0) {
-      parentPort.postMessage({
-        error: `Found ${operationsArray.length} GraphQL operations in ${filePath}`
-      });
-    }
-
-    parentPort.postMessage({
-      operations: operationsArray,
-      filePath,
-      origin: origin || filePath
+    const w = await getWorker();
+    w.postMessage({
+      filePath: entry.filePath,
+      code,
+      origin: entry.origin,
+      aggressive: !!options.aggressive,
+      verbose: !!options.verbose,
     });
+    // worker's 'message' handler above handles completion + recycling
+  })));
+
+  // Wait for all workers to finish
+  await new Promise(resolve => {
+    const check = () => {
+      if (idle.length === poolSize) resolve();
+      else setTimeout(check, 50);
+    };
+    check();
   });
-  return;
-}
 
-async function processFiles(fileEntries) {
-  const bar = new cliProgress.SingleBar({
-    format: '🚀 {bar} | {percentage}% | {value}/{total} files | ETA: {eta}s',
-    hideCursor: true
-  }, cliProgress.Presets.shades_classic);
-
-  // Handle both string paths and {filePath, origin} objects
-  const entries = fileEntries.map(entry => typeof entry === 'string' ?
-    { filePath: entry, origin: entry } : entry);
-
-  bar.start(entries.length, 0);
-
-  const limit = pLimit(options.concurrency);
-  const allOperations = new Map();
-  const workers = Array.from({ length: Math.min(options.concurrency, entries.length) }, () => new Worker(__filename));
-
-  const processEntry = async (entry) => {
-    const worker = workers.pop();
-    if (!worker) return;
-
-    return new Promise((resolve) => {
-      worker.on('message', ({ operations, error }) => {
-        if (error && options.verbose) console.error(error);
-        if (operations) {
-          operations.forEach(op => {
-            const signature = op.operation.replace(/\s+/g, ' ').trim();
-            if (!allOperations.has(signature)) {
-              allOperations.set(signature, op);
-            }
-          });
-        }
-        bar.increment();
-        workers.push(worker);
-        resolve();
-      });
-
-      fs.stat(entry.filePath, (err, stats) => {
-        if (err || stats.size > MAX_FILE_SIZE_SYNC) {
-          const chunks = [];
-          fs.createReadStream(entry.filePath)
-            .on('data', chunk => chunks.push(chunk))
-            .on('end', () => {
-              worker.postMessage({
-                filePath: entry.filePath,
-                code: Buffer.concat(chunks).toString(),
-                origin: entry.origin
-              });
-            })
-            .on('error', () => {
-              workers.push(worker);
-              resolve();
-            });
-        } else {
-          fs.readFile(entry.filePath, 'utf8', (err, code) => {
-            if (err) {
-              workers.push(worker);
-              return resolve();
-            }
-            worker.postMessage({
-              filePath: entry.filePath,
-              code,
-              origin: entry.origin
-            });
-          });
-        }
-      });
-    });
-  };
-
-  await Promise.all(entries.map(entry => limit(() => processEntry(entry))));
-  workers.forEach(w => w.terminate());
+  idle.forEach(w => w.terminate());
   bar.stop();
 
-  return Array.from(allOperations.values());
+  return Array.from(allOps.values());
 }
 
+// ─── Postman collection generator ────────────────────────────────────────────
 function generatePostmanCollection(operations) {
   return {
     info: {
-      name: "GraphQL Queries",
-      schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+      name: 'GraphQL Queries (extracted)',
+      schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
     },
-    variable: [
-      { key: "GRAPHQL_ENDPOINT", value: "", type: "string" }
-    ],
+    variable: [{ key: 'GRAPHQL_ENDPOINT', value: '', type: 'string' }],
     item: operations.map(op => ({
       name: op.name || 'AnonymousOperation',
       request: {
-        method: "POST",
+        method: 'POST',
         header: [
-          { key: "Content-Type", value: "application/json" },
-          { key: "Accept", value: "application/json" }
+          { key: 'Content-Type', value: 'application/json' },
+          { key: 'Accept',       value: 'application/json' },
         ],
         body: {
-          mode: "graphql",
+          mode: 'graphql',
           graphql: {
             query: op.operation,
-            variables: JSON.stringify(op.variables, null, 2)
-          }
+            variables: JSON.stringify(op.variables, null, 2),
+          },
         },
-        url: {
-          raw: "{{GRAPHQL_ENDPOINT}}",
-          host: ["{{GRAPHQL_ENDPOINT}}"]
-        }
+        url: { raw: '{{GRAPHQL_ENDPOINT}}', host: ['{{GRAPHQL_ENDPOINT}}'] },
       },
-      event: [
-        {
-          listen: "prerequest",
-          script: {
-            type: "text/javascript",
-            exec: [
-              `// Detected from: ${op.source}`,
-              `// Context: ${op.context || 'standard'}`,
-              `// Operation: ${op.name}`
-            ]
-          }
-        }
-      ]
-    }))
+      event: [{
+        listen: 'prerequest',
+        script: {
+          type: 'text/javascript',
+          exec: [
+            `// Source:  ${op.source}`,
+            `// Context: ${op.context}`,
+            `// Origin:  ${op.origin}`,
+          ],
+        },
+      }],
+    })),
   };
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   validateRequiredVariables();
 
   let fileEntries = [];
 
   if (options.urlList) {
-    console.log(`📄 Processing URL list from: ${options.urlList}`);
+    console.log(`📄 Processing URL list: ${options.urlList}`);
     fileEntries = await processUrlList(options.urlList);
   } else if (isRemotePath(options.input)) {
-    console.log(`🌐 Fetching remote JS from ${options.input}`);
+    console.log(`🌐 Fetching remote file: ${options.input}`);
     const code = await fetchRemoteCode(options.input);
-    const tmpFile = path.join(__dirname, '__tmp_remote.js');
-    fs.writeFileSync(tmpFile, code);
-    fileEntries = [{ filePath: tmpFile, origin: options.input }];
+    const tmp = path.join(__dirname, '__tmp_remote__.js');
+    fs.writeFileSync(tmp, code);
+    fileEntries = [{ filePath: tmp, origin: options.input }];
   } else {
     const paths = await fg([options.input], {
       absolute: true,
-      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**']
+      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**'],
     });
     fileEntries = paths.map(p => ({ filePath: p, origin: p }));
   }
 
   if (!fileEntries.length) {
-    console.log('ℹ️ No files found matching pattern:', options.input || options.urlList);
+    console.log('ℹ️  No files found for:', options.input || options.urlList);
     return;
   }
 
-  console.log(`📂 Found ${fileEntries.length} files/URLs to process`);
-  if (options.aggressive) {
-    console.log('🔍 Aggressive mode enabled for minified code detection');
-  }
+  console.log(`📂 Processing ${fileEntries.length} file(s)`);
+  if (options.aggressive) console.log('🔍 Aggressive mode active');
 
   const queries = await processFiles(fileEntries);
 
   if (!queries.length) {
-    console.log('ℹ️ No GraphQL operations found');
-    if (!options.aggressive) {
-      console.log('💡 Try using --aggressive flag for minified/bundled code');
-    }
+    console.log('ℹ️  No GraphQL operations found.');
+    console.log('💡 Try --aggressive for minified/bundled code.');
     return;
   }
 
-  // Create output directory structure
-  const outputDir = path.dirname(options.output);
-  const baseName = path.basename(options.output, '.json');
-  const urlOutputDir = path.join(outputDir, `${baseName}_sources`);
-  fs.mkdirSync(urlOutputDir, { recursive: true });
+  // ── Output structure ─────────────────────────────────────────────────────
+  const outDir  = path.dirname(options.output);
+  const outBase = path.basename(options.output, '.json');
+  const srcDir  = path.join(outDir, `${outBase}_sources`);
+  fs.mkdirSync(srcDir, { recursive: true });
 
-  // Group operations by origin
-  const operationsByOrigin = queries.reduce((acc, op) => {
-    const origin = op.origin || 'unknown';
-    if (!acc[origin]) acc[origin] = [];
-    acc[origin].push(op);
-    return acc;
-  }, {});
-
-  // Save individual origin files
-  Object.entries(operationsByOrigin).forEach(([origin, ops]) => {
-    const safeName = origin.replace(/[^a-z0-9]/gi, '_').slice(0, 100);
-    const individualFile = path.join(urlOutputDir, `${safeName}.json`);
-    fs.writeFileSync(individualFile, JSON.stringify(ops, null, 2));
+  // Group by origin
+  const byOrigin = {};
+  queries.forEach(op => {
+    const k = op.origin || 'unknown';
+    (byOrigin[k] = byOrigin[k] || []).push(op);
+  });
+  Object.entries(byOrigin).forEach(([origin, ops]) => {
+    const name = origin.replace(/[^a-z0-9]/gi, '_').slice(0, 100) + '.json';
+    fs.writeFileSync(path.join(srcDir, name), JSON.stringify(ops, null, 2));
   });
 
-  // Save combined output
-  const enhancedQueries = queries.map(q => ({
+  // Combined output
+  const enriched = queries.map(q => ({
     ...q,
     detectedAt: new Date().toISOString(),
-    toolVersion: '1.3.0'
+    toolVersion: '2.0.0',
   }));
-  fs.writeFileSync(options.output, JSON.stringify(enhancedQueries, null, 2));
-  console.log(`✅ Extracted ${queries.length} operations to ${options.output}`);
+  fs.writeFileSync(options.output, JSON.stringify(enriched, null, 2));
+  console.log(`\n✅ ${queries.length} operations → ${options.output}`);
 
-  // Show detection summary
-  const contextSummary = queries.reduce((acc, q) => {
-    acc[q.context || 'standard'] = (acc[q.context || 'standard'] || 0) + 1;
-    return acc;
-  }, {});
-
-  console.log('📊 Detection Summary:');
-  Object.entries(contextSummary).forEach(([context, count]) => {
-    console.log(`   ${context}: ${count} operations`);
-  });
-
-  // Show origin summary
-  const originSummary = queries.reduce((acc, q) => {
-    const origin = q.origin || 'unknown';
-    acc[origin] = (acc[origin] || 0) + 1;
-    return acc;
-  }, {});
-
-  console.log('🌐 Origin Summary:');
-  Object.entries(originSummary).forEach(([origin, count]) => {
-    console.log(`   ${origin}: ${count} operations`);
-  });
+  // Summary
+  const ctxSummary = {};
+  queries.forEach(q => { ctxSummary[q.context] = (ctxSummary[q.context] || 0) + 1; });
+  console.log('\n📊 Detection breakdown:');
+  Object.entries(ctxSummary).sort((a, b) => b[1] - a[1]).forEach(([ctx, n]) =>
+    console.log(`   ${ctx.padEnd(30)} ${n}`));
 
   if (options.postman) {
-    const postmanFile = options.output.replace('.json', '.postman.json');
-    fs.writeFileSync(postmanFile, JSON.stringify(generatePostmanCollection(queries), null, 2));
-    console.log(`📦 Postman collection saved to ${postmanFile}`);
+    const pmFile = options.output.replace('.json', '.postman.json');
+    fs.writeFileSync(pmFile, JSON.stringify(generatePostmanCollection(queries), null, 2));
+    console.log(`\n📦 Postman collection → ${pmFile}`);
   }
 
-  // Cleanup temporary files
-  if (isRemotePath(options.input) || options.urlList) {
-    const tempDir = path.join(__dirname, 'url_analysis_temp');
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true });
-    }
-  }
+  // Cleanup temp files
+  const tempDir = path.join(__dirname, '__gql_temp__');
+  if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
+  const tmpRemote = path.join(__dirname, '__tmp_remote__.js');
+  if (fs.existsSync(tmpRemote)) fs.unlinkSync(tmpRemote);
 }
 
 main().catch(err => {
-  console.error('❌ Fatal error:', err);
+  console.error('❌ Fatal:', err.message);
+  if (options.verbose) console.error(err.stack);
   process.exit(1);
 });
