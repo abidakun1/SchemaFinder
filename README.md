@@ -5,8 +5,18 @@ A Node.js CLI tool for extracting GraphQL operations from JavaScript code, inclu
 
 
 
+## Features
 
-# Features
+- **Multi-source extraction** — tagged templates (`gql`, `graphql`, `apollo`), inline HTTP calls (`fetch`, `axios`), string literals, template literals, commented-out queries
+- **Real GQL validation** — every candidate is parsed through `graphql`'s own parser, eliminating false positives from minified code
+- **Minified/bundled code** — specialised passes for compressed JavaScript with `--aggressive` mode
+- **Auth header support** — pass `Authorization`, `Cookie`, or any custom headers for protected assets via `--headers`
+- **Retry with backoff** — remote fetches retry automatically with exponential backoff + jitter
+- **Batch processing** — process a list of URLs in parallel via `--url-list`
+- **Postman export** — outputs a ready-to-use Postman collection including any auth headers
+- **Parallel processing** — configurable worker pool with lazy spawning
+- **Per-origin output** — results split by source file for clean analysis
+
 
 ✅ **Multi-Source Extraction**:
 - Tagged templates (gql, graphql, apollo, gqlTag, GraphQL and common aliases)
@@ -101,13 +111,30 @@ If you want to extract GraphQL queries and mutations directly from a remote Java
 schemafinder -i "https://example.com/path/to/file.js" -o queries.json
 ```
 
-4. Aggressive minified code detection:
+
+4. Authenticated remote scan
+```bash
+schemafinder -i "https://app.example.com/main.chunk.js" -o results.json \
+  --headers '{"Authorization":"Bearer TOKEN"}'
+```
+
+
+5. Batch with auth + aggressive + Postman export
+```bash
+schemafinder --url-list js_urls.txt \
+  -o results.json \
+  --aggressive \
+  --postman \
+  --retries 5 \
+  --headers '{"Cookie":"sessionid=abc; csrftoken=xyz"}'
+``` 
+6. Aggressive minified code detection:
 
 ```bash
 schemafinder -i "dist/*.min.js" -o queries.json --aggressive
 ```
 
-5. Extract and export as a Postman collection
+7. Extract and export as a Postman collection
 
 To extract GraphQL schema from JavaScript files and export them as a Postman Collection:
 
@@ -122,21 +149,29 @@ schemafinder -i "src/**/*.js" -o queries.json --postman
 
 # Options
 
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i, --input <pattern>` | Glob pattern, local file path, or remote URL | — |
+| `-o, --output <file>` | Output JSON file (required) | — |
+| `--url-list <file>` | Text file of JS URLs, one per line | — |
+| `--postman` | Export results as a Postman collection | false |
+| `--concurrency <n>` | Max parallel worker threads | 4 |
+| `--aggressive` | Enable all detection passes (slower, catches more) | false |
+| `--headers <json>` | JSON object of custom request headers | — |
+| `--retries <n>` | Retry attempts for failed remote fetches | 3 |
+| `--verbose` | Verbose logging | false |
+
+
+## Recommended Workflow (Bug Bounty)
+```
+Katana / GAU → JS URLs → SchemaFinder → Postman Collection → Burp Suite
 ```
 
-Options:
-  -V, --version                   Output tool version
-  -i, --input <pattern>           Glob/file/URL for input files
-  -o, --output <file>             Output JSON file (required)
-  --url-list <file>               Text file containing JS URLs (one per line)
-  --postman                       Generate Postman collection
-  --concurrency <n>               Max parallel files (default: 4)
-  --aggressive                    Use aggressive detection for minified code
-  --verbose                       Verbose logging
-  -h, --help                      Display help
-
-```
-
+1. Use **Katana** or **GAU** to collect all JS endpoint URLs from a target
+2. Feed them into SchemaFinder via `--url-list`
+3. Export with `--postman` and import into Burp or Postman
+4. Fuzz each operation for IDOR, auth bypass, or info leakage
 
 
 # Summary
