@@ -10,7 +10,7 @@ const parser = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
 const fg = require('fast-glob');
 const fetch = require('node-fetch');
-const { parse: parseGQL, print: printGQL } = require('graphql');
+const { parse: parseGQL, print: printGQL, buildClientSchema, getIntrospectionQuery } = require('graphql');
 const cliProgress = require('cli-progress');
 const pLimit = require('p-limit');
 const https = require('https');
@@ -18,7 +18,7 @@ const dns = require('dns');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 const DEFAULT_CONCURRENCY = 4;
-const MAX_FILE_SIZE_SYNC = 1024 * 1024; // 1MB
+const MAX_FILE_SIZE_SYNC = 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const FETCH_RETRIES = 3;
 const FETCH_RETRY_BASE_MS = 800;
@@ -33,7 +33,7 @@ const HTTP_CLIENTS = new Set([
   'fetch', 'axios', 'request', 'got', 'superagent', 'ky', '$http', 'http',
 ]);
 
-// ─── GQL validator — confirms candidate is real GQL and normalises whitespace ─
+// ─── GQL validator ────────────────────────────────────────────────────────────
 function validateAndNormalise(raw) {
   try {
     return printGQL(parseGQL(raw)).trim();
@@ -43,7 +43,6 @@ function validateAndNormalise(raw) {
 }
 
 // ─── Balanced brace extractor ─────────────────────────────────────────────────
-// Fresh RegExp every call — avoids lastIndex bleed in concurrent use.
 function extractBalancedGQL(text) {
   const ops = [];
   const KW_RE = /\b(query|mutation|subscription|fragment)\b/g;
@@ -68,7 +67,6 @@ function extractBalancedGQL(text) {
 
     const nameMatch = raw.match(/^(?:query|mutation|subscription|fragment)\s+([A-Za-z_][A-Za-z0-9_]*)/);
     ops.push({ raw, name: nameMatch ? nameMatch[1] : 'Anonymous' });
-
     KW_RE.lastIndex = end + 1;
   }
   return ops;
@@ -118,12 +116,142 @@ function tryBase64GQL(str) {
 }
 
 // ─── Concatenation resolver ───────────────────────────────────────────────────
-// Only merges same-delimiter adjacent strings — avoids corrupting real code.
 function resolveStringConcatenation(code) {
   return code
     .replace(/'\s*\+\s*'/g, '')
     .replace(/"\s*\+\s*"/g, '')
     .replace(/`\s*\+\s*`/g, '');
+}
+
+// ─── INTROSPECTION ────────────────────────────────────────────────────────────
+
+// Sends a full introspection query to the endpoint and returns the raw result
+async function fetchIntrospectionSchema(endpoint, headers) {
+  console.log(`\n🔭 Running introspection on: ${endpoint}`);
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      ...headers,
+    },
+    body: JSON.stringify({ query: getIntrospectionQuery() }),
+    agent: /^https/.test(endpoint)
+      ? new https.Agent({ family: 4, timeout: FETCH_TIMEOUT_MS })
+      : undefined,
+  });
+
+  if (!res.ok) throw new Error(`Introspection HTTP ${res.status}: ${res.statusText}`);
+
+  const json = await res.json();
+  if (json.errors) throw new Error(`Introspection errors: ${JSON.stringify(json.errors)}`);
+  if (!json.data) throw new Error('Introspection returned no data');
+
+  return json.data;
+}
+
+// Extracts every query, mutation, and subscription the server exposes
+// Returns an array of SchemaFinder-compatible operation objects
+function extractOperationsFromSchema(introspectionData, endpoint) {
+  const schema = buildClientSchema(introspectionData);
+  const ops = [];
+
+  const typeMap = {
+    query:        schema.getQueryType(),
+    mutation:     schema.getMutationType(),
+    subscription: schema.getSubscriptionType(),
+  };
+
+  for (const [opType, rootType] of Object.entries(typeMap)) {
+    if (!rootType) continue;
+
+    const fields = rootType.getFields();
+    for (const [fieldName, field] of Object.entries(fields)) {
+      // Build a minimal but valid operation for each root field
+      const args = field.args || [];
+      const argSignature = args.length
+        ? `(${args.map(a => `$${a.name}: ${a.type}`).join(', ')})`
+        : '';
+      const argPass = args.length
+        ? `(${args.map(a => `${a.name}: $${a.name}`).join(', ')})`
+        : '';
+
+      // Build field selection — go 2 levels deep for scalar fields
+      const selection = buildSelection(field.type, 2);
+
+      const raw = `${opType} ${capitalise(fieldName)}${argSignature} {\n  ${fieldName}${argPass}${selection}\n}`;
+      const normalised = validateAndNormalise(raw);
+      if (!normalised) continue;
+
+      const variables = {};
+      args.forEach(a => {
+        variables[a.name] = inferDefaultValue(String(a.type));
+      });
+
+      ops.push({
+        operation: normalised,
+        name: capitalise(fieldName),
+        variables,
+        source: endpoint,
+        origin: endpoint,
+        context: 'introspection',
+        detectedAt: new Date().toISOString(),
+        toolVersion: '2.2.0',
+      });
+    }
+  }
+
+  return ops;
+}
+
+// Recursively unwrap GraphQL type wrappers (NonNull, List) to get the named type
+function unwrapType(type) {
+  if (type.ofType) return unwrapType(type.ofType);
+  return type;
+}
+
+// Build a minimal field selection set, going `depth` levels deep
+function buildSelection(type, depth) {
+  if (depth === 0) return '';
+  const named = unwrapType(type);
+  if (!named.getFields) return ''; // scalar — no selection needed
+
+  try {
+    const fields = named.getFields();
+    const scalarFields = Object.entries(fields)
+      .filter(([, f]) => !unwrapType(f.type).getFields) // only scalars at this level
+      .slice(0, 5) // cap at 5 fields to keep output readable
+      .map(([name]) => name);
+
+    if (!scalarFields.length) return '';
+    return ` {\n    ${scalarFields.join('\n    ')}\n  }`;
+  } catch {
+    return '';
+  }
+}
+
+function capitalise(str) {
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+// Compare JS-extracted ops vs introspection ops and tag each with its coverage status
+function crossReference(jsOps, introspectionOps) {
+  const jsNames = new Set(jsOps.map(op => op.name.toLowerCase()));
+  const introNames = new Set(introspectionOps.map(op => op.name.toLowerCase()));
+
+  // Tag JS ops
+  const taggedJs = jsOps.map(op => ({
+    ...op,
+    coverage: introNames.has(op.name.toLowerCase()) ? 'confirmed' : 'js_only',
+  }));
+
+  // Only add introspection ops that are NOT already in JS output (the gap)
+  const hiddenOps = introspectionOps
+    .filter(op => !jsNames.has(op.name.toLowerCase()))
+    .map(op => ({ ...op, coverage: 'server_only' }));
+
+  return { taggedJs, hiddenOps };
 }
 
 // ─── Worker logic ─────────────────────────────────────────────────────────────
@@ -132,7 +260,6 @@ if (!isMainThread) {
     const operations = new Map();
 
     function addOp(raw, name, context, extraVars = {}) {
-      // Run through real GQL parser — kills false positives, normalises whitespace
       const normalised = validateAndNormalise(raw);
       if (!normalised) return;
       if (operations.has(normalised)) return;
@@ -147,17 +274,17 @@ if (!isMainThread) {
       });
     }
 
-    // ── PASS 1: Balanced brace extraction on raw code ─────────────────────
+    // ── PASS 1: Raw balanced brace extraction ─────────────────────────────
     extractBalancedGQL(code).forEach(({ raw, name }) => addOp(raw, name, 'raw_code'));
 
-    // ── PASS 2: Resolve string concatenations, re-extract ─────────────────
+    // ── PASS 2: Concatenation resolver ────────────────────────────────────
     const concatResolved = resolveStringConcatenation(code);
     if (concatResolved !== code) {
       extractBalancedGQL(concatResolved).forEach(({ raw, name }) =>
         addOp(raw, name, 'concat_resolved'));
     }
 
-    // ── PASS 3: Extract and decode all string literals ────────────────────
+    // ── PASS 3: String literal decode ─────────────────────────────────────
     const STRING_PATTERNS = [
       /"((?:[^"\\]|\\[\s\S])*)"/g,
       /'((?:[^'\\]|\\[\s\S])*)'/g,
@@ -172,7 +299,6 @@ if (!isMainThread) {
         if (!inner || inner.length < 15) continue;
 
         if (!/\b(query|mutation|subscription|fragment)\b/i.test(inner)) {
-          // Base64 only under --aggressive
           if (aggressive) {
             const decoded = tryBase64GQL(inner);
             if (decoded) {
@@ -385,10 +511,11 @@ function extractStringFromNode(node) {
 
 // ─── CLI setup ────────────────────────────────────────────────────────────────
 program
-  .version('2.1.0')
+  .version('2.2.0')
   .option('-i, --input <pattern>',    'Glob/file/URL for input files')
   .option('-o, --output <file>',      'Output JSON file (required)')
   .option('--url-list <file>',        'Text file containing JS URLs (one per line)')
+  .option('--endpoint <url>',         'GraphQL endpoint URL to run introspection against')
   .option('--postman',                'Generate Postman collection')
   .option('--concurrency <n>',        'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
   .option('--aggressive',             'Enable all detection passes (slower, catches more)')
@@ -399,7 +526,7 @@ program
 
 const options = program.opts();
 
-// ─── Parse --headers once ─────────────────────────────────────────────────────
+// ─── Parse --headers ──────────────────────────────────────────────────────────
 let customHeaders = {};
 if (options.headers) {
   try {
@@ -415,8 +542,9 @@ if (options.headers) {
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 function validateRequiredVariables() {
-  if (!options.input && !options.urlList) {
-    console.error('❌  --input or --url-list is required');
+  // At least one of --input, --url-list, or --endpoint must be provided
+  if (!options.input && !options.urlList && !options.endpoint) {
+    console.error('❌  --input, --url-list, or --endpoint is required');
     program.help({ error: true });
   }
   if (!options.output || typeof options.output !== 'string') {
@@ -431,7 +559,7 @@ function validateRequiredVariables() {
 
 function isRemotePath(p) { return /^https?:\/\//.test(p); }
 
-// ─── Fetch with retry + exponential backoff ───────────────────────────────────
+// ─── Fetch with retry ─────────────────────────────────────────────────────────
 async function fetchWithRetry(url) {
   const retries = options.retries ?? FETCH_RETRIES;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -445,7 +573,7 @@ async function fetchWithRetry(url) {
       const res = await fetch(url, {
         signal: controller.signal,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.1)',
+          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.2)',
           'Accept': 'application/javascript, text/javascript, */*',
           'Accept-Encoding': 'gzip, deflate',
           ...customHeaders,
@@ -459,8 +587,7 @@ async function fetchWithRetry(url) {
       if (options.verbose) console.log(`✅ Fetched ${code.length.toLocaleString()} chars — ${url}`);
       return code;
     } catch (err) {
-      const isLast = attempt > retries;
-      if (isLast) throw err;
+      if (attempt > retries) throw err;
       const delay = FETCH_RETRY_BASE_MS * Math.pow(2, attempt - 1) + Math.random() * 200;
       if (options.verbose) console.warn(`⚠️  Attempt ${attempt} failed (${err.message}) — retrying in ${Math.round(delay)}ms`);
       await sleep(delay);
@@ -478,7 +605,6 @@ async function processUrlList(filePath) {
   if (!urls.length) { console.log('ℹ️  No valid URLs in list'); return []; }
   console.log(`🌐 ${urls.length} URLs to process`);
 
-  // Use os.tmpdir() — never pollute the install directory
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schemafinder-'));
   const limit = pLimit(options.concurrency);
   const entries = [];
@@ -489,7 +615,7 @@ async function processUrlList(filePath) {
       const name = url.replace(/[^a-z0-9]/gi, '_').slice(0, 100) + '.js';
       const fp = path.join(tempDir, name);
       fs.writeFileSync(fp, code);
-      entries.push({ filePath: fp, origin: url, _tempDir: tempDir });
+      entries.push({ filePath: fp, origin: url });
     } catch (e) {
       console.error(`❌ ${url}: ${e.message}`);
     }
@@ -514,7 +640,6 @@ async function processFiles(fileEntries) {
   const allOps = new Map();
   const poolSize = Math.min(options.concurrency, entries.length);
 
-  // ── Promise-based worker pool — no polling, no race conditions ────────
   const workerQueue = [];
   const waitQueue = [];
   let activeWorkers = 0;
@@ -523,19 +648,13 @@ async function processFiles(fileEntries) {
   const allDone = new Promise(r => { resolveAll = r; });
 
   function releaseWorker(w) {
-    if (waitQueue.length > 0) {
-      waitQueue.shift()(w);
-    } else {
-      workerQueue.push(w);
-    }
+    if (waitQueue.length > 0) waitQueue.shift()(w);
+    else workerQueue.push(w);
   }
 
   function acquireWorker() {
     if (workerQueue.length > 0) return Promise.resolve(workerQueue.pop());
-    if (activeWorkers < poolSize) {
-      activeWorkers++;
-      return Promise.resolve(spawnWorker());
-    }
+    if (activeWorkers < poolSize) { activeWorkers++; return Promise.resolve(spawnWorker()); }
     return new Promise(resolve => waitQueue.push(resolve));
   }
 
@@ -615,15 +734,14 @@ function generatePostmanCollection(operations) {
       name: 'GraphQL Queries — SchemaFinder',
       schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
     },
-    variable: [{ key: 'GRAPHQL_ENDPOINT', value: '', type: 'string' }],
+    variable: [{ key: 'GRAPHQL_ENDPOINT', value: options.endpoint || '', type: 'string' }],
     item: operations.map(op => ({
-      name: op.name || 'AnonymousOperation',
+      name: `[${op.coverage || op.context}] ${op.name || 'AnonymousOperation'}`,
       request: {
         method: 'POST',
         header: [
           { key: 'Content-Type', value: 'application/json' },
           { key: 'Accept',       value: 'application/json' },
-          // Carry through any custom auth headers into every request
           ...Object.entries(customHeaders).map(([k, v]) => ({ key: k, value: v })),
         ],
         body: {
@@ -640,9 +758,9 @@ function generatePostmanCollection(operations) {
         script: {
           type: 'text/javascript',
           exec: [
-            `// Source:  ${op.source}`,
-            `// Context: ${op.context}`,
-            `// Origin:  ${op.origin}`,
+            `// Source:   ${op.source}`,
+            `// Context:  ${op.context}`,
+            `// Coverage: ${op.coverage || 'n/a'}`,
           ],
         },
       }],
@@ -654,54 +772,97 @@ function generatePostmanCollection(operations) {
 async function main() {
   validateRequiredVariables();
 
-  let fileEntries = [];
+  let jsQueries = [];
   let tempDir = null;
 
-  if (options.urlList) {
-    console.log(`📄 Processing URL list: ${options.urlList}`);
-    fileEntries = await processUrlList(options.urlList);
-    if (fileEntries.length > 0) tempDir = path.dirname(fileEntries[0].filePath);
-  } else if (isRemotePath(options.input)) {
-    console.log(`🌐 Fetching: ${options.input}`);
-    const code = await fetchWithRetry(options.input);
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schemafinder-'));
-    const tmp = path.join(tempDir, '__remote__.js');
-    fs.writeFileSync(tmp, code);
-    fileEntries = [{ filePath: tmp, origin: options.input }];
-  } else {
-    const paths = await fg([options.input], {
-      absolute: true,
-      ignore: ['**/node_modules/**', '**/dist/**', '**/build/**'],
-    });
-    fileEntries = paths.map(p => ({ filePath: p, origin: p }));
+  // ── Step 1: JS extraction (if --input or --url-list provided) ────────────
+  if (options.input || options.urlList) {
+    let fileEntries = [];
+
+    if (options.urlList) {
+      console.log(`📄 Processing URL list: ${options.urlList}`);
+      fileEntries = await processUrlList(options.urlList);
+      if (fileEntries.length > 0) tempDir = path.dirname(fileEntries[0].filePath);
+    } else if (isRemotePath(options.input)) {
+      console.log(`🌐 Fetching: ${options.input}`);
+      const code = await fetchWithRetry(options.input);
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'schemafinder-'));
+      const tmp = path.join(tempDir, '__remote__.js');
+      fs.writeFileSync(tmp, code);
+      fileEntries = [{ filePath: tmp, origin: options.input }];
+    } else {
+      const paths = await fg([options.input], {
+        absolute: true,
+        ignore: ['**/node_modules/**', '**/dist/**', '**/build/**'],
+      });
+      fileEntries = paths.map(p => ({ filePath: p, origin: p }));
+    }
+
+    if (fileEntries.length) {
+      console.log(`📂 Processing ${fileEntries.length} file(s)${options.aggressive ? ' [aggressive mode]' : ''}`);
+      jsQueries = await processFiles(fileEntries);
+      console.log(`   Found ${jsQueries.length} operations in JS code`);
+    } else {
+      console.log('ℹ️  No files found.');
+    }
   }
 
-  if (!fileEntries.length) {
-    console.log('ℹ️  No files found for:', options.input || options.urlList);
+  // ── Step 2: Introspection (if --endpoint provided) ────────────────────────
+  let finalQueries = jsQueries;
+
+  if (options.endpoint) {
+    try {
+      const introspectionData = await fetchIntrospectionSchema(options.endpoint, customHeaders);
+      const introspectionOps = extractOperationsFromSchema(introspectionData, options.endpoint);
+      console.log(`   Found ${introspectionOps.length} operations via introspection`);
+
+      if (jsQueries.length > 0) {
+        // Cross-reference JS ops against server schema
+        const { taggedJs, hiddenOps } = crossReference(jsQueries, introspectionOps);
+
+        const confirmed = taggedJs.filter(o => o.coverage === 'confirmed').length;
+        const jsOnly    = taggedJs.filter(o => o.coverage === 'js_only').length;
+
+        console.log('\n🗺️  Coverage report:');
+        console.log(`   ✅ Confirmed (in JS + server):  ${confirmed}`);
+        console.log(`   🟡 JS only (not on server):     ${jsOnly}`);
+        console.log(`   🔴 Server only (hidden ops):    ${hiddenOps.length}`);
+
+        if (hiddenOps.length > 0) {
+          console.log('\n🚨 Hidden operations (server exposes, frontend never calls):');
+          hiddenOps.forEach(op => console.log(`   → ${op.name}`));
+        }
+
+        finalQueries = [...taggedJs, ...hiddenOps];
+      } else {
+        // Pure introspection mode — no JS files
+        finalQueries = introspectionOps;
+        console.log(`   Pure introspection mode — ${introspectionOps.length} operations`);
+      }
+    } catch (err) {
+      console.error(`\n⚠️  Introspection failed: ${err.message}`);
+      console.error('   Continuing with JS extraction results only.');
+      if (options.verbose) console.error(err.stack);
+    }
+  }
+
+  if (!finalQueries.length) {
+    console.log('\nℹ️  No GraphQL operations found.');
+    console.log('💡 Tips:');
+    console.log('   • Try --aggressive for minified/bundled code');
+    console.log('   • Add --endpoint to probe the server directly');
     return;
   }
 
-  console.log(`📂 Processing ${fileEntries.length} file(s)${options.aggressive ? ' [aggressive mode]' : ''}`);
-  if (Object.keys(customHeaders).length) {
-    console.log(`🔑 Custom headers active: ${Object.keys(customHeaders).join(', ')}`);
-  }
-
-  const queries = await processFiles(fileEntries);
-
-  if (!queries.length) {
-    console.log('ℹ️  No GraphQL operations found.');
-    console.log('💡 Tip: try --aggressive for minified/bundled code.');
-    return;
-  }
-
-  // ── Output ───────────────────────────────────────────────────────────────
+  // ── Step 3: Output ────────────────────────────────────────────────────────
   const outDir  = path.dirname(options.output);
   const outBase = path.basename(options.output, '.json');
   const srcDir  = path.join(outDir, `${outBase}_sources`);
   fs.mkdirSync(srcDir, { recursive: true });
 
+  // Per-origin split files
   const byOrigin = {};
-  queries.forEach(op => {
+  finalQueries.forEach(op => {
     const k = op.origin || 'unknown';
     (byOrigin[k] = byOrigin[k] || []).push(op);
   });
@@ -710,27 +871,29 @@ async function main() {
     fs.writeFileSync(path.join(srcDir, name), JSON.stringify(ops, null, 2));
   });
 
-  const enriched = queries.map(q => ({
+  // Combined output
+  const enriched = finalQueries.map(q => ({
     ...q,
-    detectedAt: new Date().toISOString(),
-    toolVersion: '2.1.0',
+    detectedAt: q.detectedAt || new Date().toISOString(),
+    toolVersion: '2.2.0',
   }));
   fs.writeFileSync(options.output, JSON.stringify(enriched, null, 2));
-  console.log(`\n✅ ${queries.length} operations → ${options.output}`);
+  console.log(`\n✅ ${finalQueries.length} total operations → ${options.output}`);
 
+  // Detection breakdown
   const ctxSummary = {};
-  queries.forEach(q => { ctxSummary[q.context] = (ctxSummary[q.context] || 0) + 1; });
+  finalQueries.forEach(q => { ctxSummary[q.context] = (ctxSummary[q.context] || 0) + 1; });
   console.log('\n📊 Detection breakdown:');
   Object.entries(ctxSummary).sort((a, b) => b[1] - a[1]).forEach(([ctx, n]) =>
     console.log(`   ${ctx.padEnd(32)} ${n}`));
 
   if (options.postman) {
     const pmFile = options.output.replace('.json', '.postman.json');
-    fs.writeFileSync(pmFile, JSON.stringify(generatePostmanCollection(queries), null, 2));
+    fs.writeFileSync(pmFile, JSON.stringify(generatePostmanCollection(finalQueries), null, 2));
     console.log(`\n📦 Postman collection → ${pmFile}`);
   }
 
-  // Cleanup — only delete dirs we created in os.tmpdir()
+  // Cleanup temp dirs
   if (tempDir && tempDir.startsWith(os.tmpdir())) {
     try { fs.rmSync(tempDir, { recursive: true }); } catch {}
   }
