@@ -8,12 +8,14 @@ A Node.js CLI tool for extracting GraphQL operations from JavaScript code, inclu
 ## Features
 
 - **Multi-source extraction** — tagged templates (`gql`, `graphql`, `apollo`), inline HTTP calls (`fetch`, `axios`), string literals, template literals, commented-out queries
+- **Live introspection** — probe a GraphQL endpoint directly to discover every operation the server exposes, including ones never referenced in frontend code
+- **Cross-referencing** — when used together, JS extraction and introspection are compared to produce a coverage report: confirmed, JS-only, and hidden server-only operations
 - **Real GQL validation** — every candidate is parsed through `graphql`'s own parser, eliminating false positives from minified code
 - **Minified/bundled code** — specialised passes for compressed JavaScript with `--aggressive` mode
-- **Auth header support** — pass `Authorization`, `Cookie`, or any custom headers for protected assets via `--headers`
+- **Auth header support** — pass `Authorization`, `Cookie`, or any custom headers for protected assets and authenticated endpoints via `--headers`
 - **Retry with backoff** — remote fetches retry automatically with exponential backoff + jitter
 - **Batch processing** — process a list of URLs in parallel via `--url-list`
-- **Postman export** — outputs a ready-to-use Postman collection including any auth headers
+- **Postman export** — outputs a ready-to-use Postman collection including auth headers and pre-filled endpoint URL, works with both JS extraction and introspection
 - **Parallel processing** — configurable worker pool with lazy spawning
 - **Per-origin output** — results split by source file for clean analysis
 
@@ -93,54 +95,59 @@ npm link   # or use directly via `node schemafinder.js`
 
 # Usage
 
-1. Extract GraphQL queries from a file or folder
 
+### Extract from a local file or folder
 ```bash
 schemafinder -i "src/**/*.js" -o extracted.json
 ```
-2. Batch URL processing:
 
-
+### Extract from a remote JS file
 ```bash
-schemafinder --url-list urls.txt -o queries.json
+schemafinder -i "https://example.com/static/js/main.chunk.js" -o queries.json
 ```
 
-3. Remote File Parsing (Direct URL Input)
-If you want to extract GraphQL queries and mutations directly from a remote JavaScript file, you can provide the URL of the file as input. Here’s how:
-```bash
-schemafinder -i "https://example.com/path/to/file.js" -o queries.json
-```
-
-
-4. Authenticated remote scan
+### Authenticated remote scan
 ```bash
 schemafinder -i "https://app.example.com/main.chunk.js" -o results.json \
   --headers '{"Authorization":"Bearer TOKEN"}'
 ```
 
+### Batch URL processing
+```bash
+schemafinder --url-list urls.txt -o queries.json
+```
 
-5. Batch with auth + aggressive + Postman export
+### Introspection only — probe the server directly
+```bash
+schemafinder --endpoint https://api.example.com/graphql \
+  -o results.json \
+  --headers '{"Authorization":"Bearer TOKEN"}'
+```
+
+### Introspection + Postman export
+```bash
+schemafinder --endpoint https://api.example.com/graphql \
+  -o results.json \
+  --postman \
+  --headers '{"Authorization":"Bearer TOKEN"}'
+```
+The exported Postman collection will have `{{GRAPHQL_ENDPOINT}}` pre-filled with your target URL and your auth headers baked into every request.
+
+### Full combined recon — JS extraction + introspection + cross-reference
 ```bash
 schemafinder --url-list js_urls.txt \
+  --endpoint https://api.example.com/graphql \
   -o results.json \
-  --aggressive \
   --postman \
-  --retries 5 \
-  --headers '{"Cookie":"sessionid=abc; csrftoken=xyz"}'
-``` 
-6. Aggressive minified code detection:
+  --headers '{"Authorization":"Bearer TOKEN","Cookie":"session=abc"}'
+```
 
+### Aggressive mode for minified/bundled code
 ```bash
 schemafinder -i "dist/*.min.js" -o queries.json --aggressive
 ```
 
-7. Extract and export as a Postman collection
-
-To extract GraphQL schema from JavaScript files and export them as a Postman Collection:
-
-```bash
-schemafinder -i "src/**/*.js" -o queries.json --postman
-```
+---
 
 
 
@@ -155,12 +162,81 @@ schemafinder -i "src/**/*.js" -o queries.json --postman
 | `-i, --input <pattern>` | Glob pattern, local file path, or remote URL | — |
 | `-o, --output <file>` | Output JSON file (required) | — |
 | `--url-list <file>` | Text file of JS URLs, one per line | — |
+| `--endpoint <url>` | GraphQL endpoint to run introspection against | — |
 | `--postman` | Export results as a Postman collection | false |
 | `--concurrency <n>` | Max parallel worker threads | 4 |
 | `--aggressive` | Enable all detection passes (slower, catches more) | false |
 | `--headers <json>` | JSON object of custom request headers | — |
 | `--retries <n>` | Retry attempts for failed remote fetches | 3 |
 | `--verbose` | Verbose logging | false |
+
+
+
+
+
+
+## Introspection
+
+When `--endpoint` is provided, SchemaFinder sends a full introspection query to the server and extracts every operation it exposes — queries, mutations, and subscriptions — building minimal valid operation skeletons for each one.
+
+When used alongside `--input` or `--url-list`, results are cross-referenced to produce a coverage report:
+```
+🗺️  Coverage report:
+   ✅ Confirmed (in JS + server):  28
+   🟡 JS only (not on server):      6
+   🔴 Server only (hidden ops):     13
+
+🚨 Hidden operations (server exposes, frontend never calls):
+   → AdminDeleteUser
+   → ExportAllData
+   → ResetUserPassword
+```
+
+**Server-only operations are the most valuable finding** — these are endpoints the backend exposes but the frontend never references, making them invisible to JS-only scanning tools.
+
+Each operation in the output is tagged with a `coverage` field:
+
+| Value | Meaning |
+|-------|---------|
+| `confirmed` | Found in both JS code and server schema |
+| `js_only` | Found in JS but server didn't confirm it |
+| `server_only` | Server exposes it but frontend never calls it |
+
+When using `--postman` with `--endpoint`, the collection variable `{{GRAPHQL_ENDPOINT}}` is pre-filled with your endpoint URL automatically.
+
+---
+
+## Output
+
+Results are written to your `--output` file as a JSON array. A `_sources/` subdirectory is also created with results split by origin file.
+```json
+[
+  {
+    "operation": "query GetUser($id: ID!) {\n  user(id: $id) {\n    id\n    name\n    email\n  }\n}",
+    "name": "GetUser",
+    "variables": { "id": "sample-string" },
+    "source": "/path/to/file.js",
+    "origin": "https://example.com/main.chunk.js",
+    "context": "tagged_template",
+    "coverage": "confirmed",
+    "detectedAt": "2025-08-05T12:00:00.000Z",
+    "toolVersion": "2.2.0"
+  },
+  {
+    "operation": "mutation AdminDeleteUser($id: ID!) {\n  adminDeleteUser(id: $id) {\n    success\n  }\n}",
+    "name": "AdminDeleteUser",
+    "variables": { "id": "sample-string" },
+    "source": "https://api.example.com/graphql",
+    "origin": "https://api.example.com/graphql",
+    "context": "introspection",
+    "coverage": "server_only",
+    "detectedAt": "2025-08-05T12:00:00.000Z",
+    "toolVersion": "2.2.0"
+  }
+]
+```
+
+---
 
 
 ## Recommended Workflow (Bug Bounty)
