@@ -7,17 +7,19 @@ A Node.js CLI tool for extracting GraphQL operations from JavaScript code, inclu
 
 ## Features
 
+
 - **Multi-source extraction** — tagged templates (`gql`, `graphql`, `apollo`), inline HTTP calls (`fetch`, `axios`), string literals, template literals, commented-out queries
-- **Live introspection** — probe a GraphQL endpoint directly to discover every operation the server exposes, including ones never referenced in frontend code
-- **Cross-referencing** — when used together, JS extraction and introspection are compared to produce a coverage report: confirmed, JS-only, and hidden server-only operations
-- **Real GQL validation** — every candidate is parsed through `graphql`'s own parser, eliminating false positives from minified code
+- **Live introspection** — probe a GraphQL endpoint directly to discover every operation the server exposes
+- **Introspection bypass engine** — automatically tries 9 strategies when standard introspection is blocked: whitespace tricks, GET requests, alternative content-types, and `__type` partial recovery
+- **Cross-referencing** — compare JS extraction vs live server schema to produce a coverage report: confirmed, JS-only, and hidden server-only operations
+- **Real GQL validation** — every candidate parsed through `graphql`'s own parser, eliminating false positives
 - **Minified/bundled code** — specialised passes for compressed JavaScript with `--aggressive` mode
-- **Auth header support** — pass `Authorization`, `Cookie`, or any custom headers for protected assets and authenticated endpoints via `--headers`
-- **Retry with backoff** — remote fetches retry automatically with exponential backoff + jitter
+- **Auth header support** — pass `Authorization`, `Cookie`, or any custom headers via `--headers`
+- **Retry with backoff** — remote fetches retry with exponential backoff + jitter
 - **Batch processing** — process a list of URLs in parallel via `--url-list`
-- **Postman export** — outputs a ready-to-use Postman collection including auth headers and pre-filled endpoint URL, works with both JS extraction and introspection
+- **Postman export** — ready-to-use collection with auth headers and pre-filled endpoint URL
 - **Parallel processing** — configurable worker pool with lazy spawning
-- **Per-origin output** — results split by source file for clean analysis
+- **Per-origin output** — results split by source file
 
 
 ✅ **Multi-Source Extraction**:
@@ -174,12 +176,25 @@ schemafinder -i "dist/*.min.js" -o queries.json --aggressive
 
 
 
+## Introspection & Bypass
 
-## Introspection
+When `--endpoint` is provided, SchemaFinder sends a full introspection query. If blocked, it automatically tries 9 bypass strategies:
 
-When `--endpoint` is provided, SchemaFinder sends a full introspection query to the server and extracts every operation it exposes — queries, mutations, and subscriptions — building minimal valid operation skeletons for each one.
+| # | Strategy | What it exploits |
+|---|----------|-----------------|
+| 1 | Standard POST | Baseline |
+| 2 | Newline after `__schema` | Regex matches `__schema{` not `__schema\n{` |
+| 3 | Tab after `__schema` | Same with `\t` |
+| 4 | Comma after `__schema` | GraphQL ignores commas, regex doesn't |
+| 5 | GET request | Introspection may only be blocked on POST |
+| 6 | GET minimal probe | Smaller fingerprint |
+| 7 | `application/graphql` content-type | Raw body, no JSON wrapper |
+| 8 | `x-www-form-urlencoded` | Alternative encoding |
+| 9 | `__type` partial recovery | When `__schema` is fully blocked |
 
-When used alongside `--input` or `--url-list`, results are cross-referenced to produce a coverage report:
+Use `--verbose` to see each attempt in real time.
+
+When used alongside `--input` or `--url-list`, results are cross-referenced:
 ```
 🗺️  Coverage report:
    ✅ Confirmed (in JS + server):  28
