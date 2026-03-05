@@ -1,7 +1,7 @@
 {
   "name": "schemafinder",
-  "version": "2.2.0",
-  "description": "Find and extract GraphQL operations from JavaScript files and remote endpoints",
+  "version": "2.3.0",
+  "description": "Find and extract GraphQL operations from JavaScript files and endpoints — with introspection bypass",
   "main": "schemafinder.js",
   "bin": {
     "schemafinder": "./schemafinder.js"
@@ -17,7 +17,9 @@
     "static-analysis",
     "pentesting",
     "ast",
-    "extractor"
+    "extractor",
+    "introspection",
+    "bypass"
   ],
   "author": "abidakun1",
   "license": "MIT",
