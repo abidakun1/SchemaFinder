@@ -256,7 +256,7 @@ Results are written to your `--output` file as a JSON array. A `_sources/` subdi
 
 ## Recommended Workflow (Bug Bounty)
 ```
-Katana / GAU → JS URLs → SchemaFinder → Postman Collection → Burp Suite
+Katana / GAU → JS URLs → SchemaFinder → Postman Collection → Burp Suite (PostmanCollectionImporter Extension by Abdulrahman)
 ```
 
 1. Use **Katana** or **GAU** to collect all JS endpoint URLs from a target
