@@ -1,6 +1,6 @@
 {
   "name": "schemafinder",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Find and extract GraphQL operations from JavaScript files and remote endpoints",
   "main": "schemafinder.js",
   "bin": {
