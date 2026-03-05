@@ -125,34 +125,190 @@ function resolveStringConcatenation(code) {
 
 // ─── INTROSPECTION ────────────────────────────────────────────────────────────
 
-// Sends a full introspection query to the endpoint and returns the raw result
+// ── NEW: Bypass strategy builder ──────────────────────────────────────────────
+// Returns ordered list of strategies to attempt when standard introspection fails.
+// Developers often block introspection by regex-matching "__schema{" — these
+// tricks exploit whitespace, encoding, HTTP method, and content-type differences
+// that bypass fragile regex filters.
+function buildBypassStrategies(endpoint) {
+  const fullQuery = getIntrospectionQuery();
+
+  // __type fallback — partial schema recovery when __schema is fully blocked
+  const typeQuery = `{
+    __type(name: "Query") {
+      fields {
+        name
+        description
+        args { name type { name kind ofType { name kind } } }
+        type { name kind ofType { name kind } }
+      }
+    }
+  }`;
+
+  return [
+    // ── Standard POST — always tried first ───────────────────────────────
+    {
+      label: 'Standard POST',
+      method: 'POST',
+      url: endpoint,
+      body: JSON.stringify({ query: fullQuery }),
+      headers: { 'Content-Type': 'application/json' },
+    },
+
+    // ── Bypass 1: newline between __schema and { ──────────────────────────
+    // Regex filters matching "__schema{" won't match "__schema\n{"
+    {
+      label: 'Bypass: newline after __schema',
+      method: 'POST',
+      url: endpoint,
+      body: JSON.stringify({ query: fullQuery.replace(/__schema\s*\{/g, '__schema\n{') }),
+      headers: { 'Content-Type': 'application/json' },
+    },
+
+    // ── Bypass 2: tab between __schema and { ─────────────────────────────
+    {
+      label: 'Bypass: tab after __schema',
+      method: 'POST',
+      url: endpoint,
+      body: JSON.stringify({ query: fullQuery.replace(/__schema\s*\{/g, '__schema\t{') }),
+      headers: { 'Content-Type': 'application/json' },
+    },
+
+    // ── Bypass 3: comma between __schema and { ────────────────────────────
+    // GraphQL parser ignores commas — regex filters typically don't account for them
+    {
+      label: 'Bypass: comma after __schema',
+      method: 'POST',
+      url: endpoint,
+      body: JSON.stringify({ query: fullQuery.replace(/__schema\s*\{/g, '__schema,{') }),
+      headers: { 'Content-Type': 'application/json' },
+    },
+
+    // ── Bypass 4: GET request with full query param ───────────────────────
+    // Introspection may only be blocked on POST
+    {
+      label: 'Bypass: GET request',
+      method: 'GET',
+      url: `${endpoint}?query=${encodeURIComponent(fullQuery)}`,
+      body: null,
+      headers: { 'Accept': 'application/json' },
+    },
+
+    // ── Bypass 5: GET with minimal probe ──────────────────────────────────
+    {
+      label: 'Bypass: GET minimal probe',
+      method: 'GET',
+      url: `${endpoint}?query=${encodeURIComponent('{__schema{queryType{name}}}')}&operationName=IntrospectionQuery`,
+      body: null,
+      headers: { 'Accept': 'application/json' },
+    },
+
+    // ── Bypass 6: application/graphql content-type ────────────────────────
+    // Raw query body with no JSON wrapper — some servers handle this differently
+    {
+      label: 'Bypass: application/graphql content-type',
+      method: 'POST',
+      url: endpoint,
+      body: fullQuery,
+      headers: { 'Content-Type': 'application/graphql' },
+    },
+
+    // ── Bypass 7: x-www-form-urlencoded ──────────────────────────────────
+    {
+      label: 'Bypass: form-urlencoded',
+      method: 'POST',
+      url: endpoint,
+      body: `query=${encodeURIComponent(fullQuery)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    },
+
+    // ── Bypass 8: __type fallback (partial schema recovery) ───────────────
+    // When __schema is completely blocked, __type often still works
+    {
+      label: 'Bypass: __type partial recovery',
+      method: 'POST',
+      url: endpoint,
+      body: JSON.stringify({ query: typeQuery }),
+      headers: { 'Content-Type': 'application/json' },
+      isPartial: true,
+    },
+
+    // ── Bypass 9: GET __type fallback ─────────────────────────────────────
+    {
+      label: 'Bypass: GET __type partial recovery',
+      method: 'GET',
+      url: `${endpoint}?query=${encodeURIComponent(typeQuery)}`,
+      body: null,
+      headers: { 'Accept': 'application/json' },
+      isPartial: true,
+    },
+  ];
+}
+
+// ── NEW: Response validator ───────────────────────────────────────────────────
+// Checks if a parsed JSON response actually contains usable introspection data
+function isValidIntrospectionResponse(json) {
+  if (!json || !json.data) return false;
+  if (json.errors && !json.data.__schema && !json.data.__type) return false;
+  return !!(json.data.__schema || json.data.__type);
+}
+
+// ── REPLACED: fetchIntrospectionSchema ───────────────────────────────────────
+// Old version did a single POST and threw on failure.
+// New version loops through all bypass strategies until one succeeds.
 async function fetchIntrospectionSchema(endpoint, headers) {
   console.log(`\n🔭 Running introspection on: ${endpoint}`);
 
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      ...headers,
-    },
-    body: JSON.stringify({ query: getIntrospectionQuery() }),
-    agent: /^https/.test(endpoint)
-      ? new https.Agent({ family: 4, timeout: FETCH_TIMEOUT_MS })
-      : undefined,
-  });
+  const strategies = buildBypassStrategies(endpoint);
+  const agentOpts = /^https/.test(endpoint)
+    ? new https.Agent({ family: 4, timeout: FETCH_TIMEOUT_MS })
+    : undefined;
 
-  if (!res.ok) throw new Error(`Introspection HTTP ${res.status}: ${res.statusText}`);
+  for (const strategy of strategies) {
+    try {
+      if (options.verbose) process.stdout.write(`   trying ${strategy.label}... `);
 
-  const json = await res.json();
-  if (json.errors) throw new Error(`Introspection errors: ${JSON.stringify(json.errors)}`);
-  if (!json.data) throw new Error('Introspection returned no data');
+      const res = await fetch(strategy.url, {
+        method: strategy.method,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.3)',
+          ...strategy.headers,
+          ...headers, // user-supplied headers always win
+        },
+        ...(strategy.body ? { body: strategy.body } : {}),
+        ...(agentOpts ? { agent: agentOpts } : {}),
+      });
 
-  return json.data;
+      if (!res.ok) {
+        if (options.verbose) console.log(`HTTP ${res.status}`);
+        continue;
+      }
+
+      let json;
+      try { json = await res.json(); }
+      catch {
+        if (options.verbose) console.log('non-JSON response');
+        continue;
+      }
+
+      if (!isValidIntrospectionResponse(json)) {
+        if (options.verbose) console.log('blocked or empty');
+        continue;
+      }
+
+      console.log(`\n   ✅ Introspection succeeded via: ${strategy.label}`);
+      return { data: json.data, isPartial: !!strategy.isPartial };
+
+    } catch (err) {
+      if (options.verbose) console.log(`error: ${err.message}`);
+      continue;
+    }
+  }
+
+  throw new Error('All introspection strategies failed — endpoint may have introspection fully disabled');
 }
 
-// Extracts every query, mutation, and subscription the server exposes
-// Returns an array of SchemaFinder-compatible operation objects
+// ── UNCHANGED: extractOperationsFromSchema ────────────────────────────────────
 function extractOperationsFromSchema(introspectionData, endpoint) {
   const schema = buildClientSchema(introspectionData);
   const ops = [];
@@ -165,10 +321,8 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
 
   for (const [opType, rootType] of Object.entries(typeMap)) {
     if (!rootType) continue;
-
     const fields = rootType.getFields();
     for (const [fieldName, field] of Object.entries(fields)) {
-      // Build a minimal but valid operation for each root field
       const args = field.args || [];
       const argSignature = args.length
         ? `(${args.map(a => `$${a.name}: ${a.type}`).join(', ')})`
@@ -176,18 +330,13 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
       const argPass = args.length
         ? `(${args.map(a => `${a.name}: $${a.name}`).join(', ')})`
         : '';
-
-      // Build field selection — go 2 levels deep for scalar fields
       const selection = buildSelection(field.type, 2);
-
       const raw = `${opType} ${capitalise(fieldName)}${argSignature} {\n  ${fieldName}${argPass}${selection}\n}`;
       const normalised = validateAndNormalise(raw);
       if (!normalised) continue;
 
       const variables = {};
-      args.forEach(a => {
-        variables[a.name] = inferDefaultValue(String(a.type));
-      });
+      args.forEach(a => { variables[a.name] = inferDefaultValue(String(a.type)); });
 
       ops.push({
         operation: normalised,
@@ -197,7 +346,7 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
         origin: endpoint,
         context: 'introspection',
         detectedAt: new Date().toISOString(),
-        toolVersion: '2.2.0',
+        toolVersion: '2.3.0',
       });
     }
   }
@@ -205,48 +354,78 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
   return ops;
 }
 
-// Recursively unwrap GraphQL type wrappers (NonNull, List) to get the named type
+// ── NEW: extractOperationsFromType ────────────────────────────────────────────
+// Used when __schema is blocked but __type partial recovery succeeds.
+// Builds minimal query skeletons from the field list returned by __type.
+function extractOperationsFromType(typeData, endpoint) {
+  if (!typeData.__type || !typeData.__type.fields) return [];
+  const ops = [];
+
+  for (const field of typeData.__type.fields) {
+    const args = field.args || [];
+    const argSignature = args.length
+      ? `(${args.map(a => `$${a.name}: ${a.type.name || 'String'}`).join(', ')})`
+      : '';
+    const argPass = args.length
+      ? `(${args.map(a => `${a.name}: $${a.name}`).join(', ')})`
+      : '';
+
+    const raw = `query ${capitalise(field.name)}${argSignature} {\n  ${field.name}${argPass} {\n    id\n  }\n}`;
+    const normalised = validateAndNormalise(raw);
+    if (!normalised) continue;
+
+    const variables = {};
+    args.forEach(a => { variables[a.name] = 'sample-string'; });
+
+    ops.push({
+      operation: normalised,
+      name: capitalise(field.name),
+      variables,
+      source: endpoint,
+      origin: endpoint,
+      context: 'introspection_partial',
+      detectedAt: new Date().toISOString(),
+      toolVersion: '2.3.0',
+    });
+  }
+
+  return ops;
+}
+
+// ── UNCHANGED ─────────────────────────────────────────────────────────────────
 function unwrapType(type) {
   if (type.ofType) return unwrapType(type.ofType);
   return type;
 }
 
-// Build a minimal field selection set, going `depth` levels deep
 function buildSelection(type, depth) {
   if (depth === 0) return '';
   const named = unwrapType(type);
-  if (!named.getFields) return ''; // scalar — no selection needed
-
+  if (!named.getFields) return '';
   try {
     const fields = named.getFields();
     const scalarFields = Object.entries(fields)
-      .filter(([, f]) => !unwrapType(f.type).getFields) // only scalars at this level
-      .slice(0, 5) // cap at 5 fields to keep output readable
+      .filter(([, f]) => !unwrapType(f.type).getFields)
+      .slice(0, 5)
       .map(([name]) => name);
-
     if (!scalarFields.length) return '';
     return ` {\n    ${scalarFields.join('\n    ')}\n  }`;
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
 
 function capitalise(str) {
   return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
-// Compare JS-extracted ops vs introspection ops and tag each with its coverage status
 function crossReference(jsOps, introspectionOps) {
   const jsNames = new Set(jsOps.map(op => op.name.toLowerCase()));
   const introNames = new Set(introspectionOps.map(op => op.name.toLowerCase()));
 
-  // Tag JS ops
   const taggedJs = jsOps.map(op => ({
     ...op,
     coverage: introNames.has(op.name.toLowerCase()) ? 'confirmed' : 'js_only',
   }));
 
-  // Only add introspection ops that are NOT already in JS output (the gap)
   const hiddenOps = introspectionOps
     .filter(op => !jsNames.has(op.name.toLowerCase()))
     .map(op => ({ ...op, coverage: 'server_only' }));
@@ -254,7 +433,7 @@ function crossReference(jsOps, introspectionOps) {
   return { taggedJs, hiddenOps };
 }
 
-// ─── Worker logic ─────────────────────────────────────────────────────────────
+// ─── Worker logic — UNCHANGED ─────────────────────────────────────────────────
 if (!isMainThread) {
   parentPort.on('message', ({ filePath, code, origin, aggressive, verbose }) => {
     const operations = new Map();
@@ -274,17 +453,14 @@ if (!isMainThread) {
       });
     }
 
-    // ── PASS 1: Raw balanced brace extraction ─────────────────────────────
     extractBalancedGQL(code).forEach(({ raw, name }) => addOp(raw, name, 'raw_code'));
 
-    // ── PASS 2: Concatenation resolver ────────────────────────────────────
     const concatResolved = resolveStringConcatenation(code);
     if (concatResolved !== code) {
       extractBalancedGQL(concatResolved).forEach(({ raw, name }) =>
         addOp(raw, name, 'concat_resolved'));
     }
 
-    // ── PASS 3: String literal decode ─────────────────────────────────────
     const STRING_PATTERNS = [
       /"((?:[^"\\]|\\[\s\S])*)"/g,
       /'((?:[^'\\]|\\[\s\S])*)'/g,
@@ -297,7 +473,6 @@ if (!isMainThread) {
       while ((m = pattern.exec(code)) !== null) {
         const inner = m[1];
         if (!inner || inner.length < 15) continue;
-
         if (!/\b(query|mutation|subscription|fragment)\b/i.test(inner)) {
           if (aggressive) {
             const decoded = tryBase64GQL(inner);
@@ -308,11 +483,9 @@ if (!isMainThread) {
           }
           continue;
         }
-
         const decoded = decodeEscapes(inner);
         extractBalancedGQL(decoded).forEach(({ raw, name }) =>
           addOp(raw, name, 'string_literal'));
-
         if (aggressive) {
           const collapsed = decoded.replace(/\s+/g, ' ');
           extractBalancedGQL(collapsed).forEach(({ raw, name }) =>
@@ -321,7 +494,6 @@ if (!isMainThread) {
       }
     }
 
-    // ── PASS 4: AST traversal ─────────────────────────────────────────────
     try {
       const ast = parser.parse(code, {
         sourceType: 'unambiguous',
@@ -342,42 +514,27 @@ if (!isMainThread) {
       traverse(ast, {
         TaggedTemplateExpression(nodePath) {
           const tag = nodePath.node.tag;
-          const tagName =
-            tag.name ||
-            (tag.property && tag.property.name) ||
-            (tag.callee && tag.callee.name);
+          const tagName = tag.name || (tag.property && tag.property.name) || (tag.callee && tag.callee.name);
           if (!tagName || !GQL_TAGS.has(tagName)) return;
-          const text = nodePath.node.quasi.quasis
-            .map(q => q.value.cooked || q.value.raw || '')
-            .join('__EXPR__');
-          extractBalancedGQL(text).forEach(({ raw, name }) =>
-            addOp(raw, name, 'tagged_template'));
+          const text = nodePath.node.quasi.quasis.map(q => q.value.cooked || q.value.raw || '').join('__EXPR__');
+          extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'tagged_template'));
         },
-
         StringLiteral(nodePath) {
           const val = nodePath.node.value;
           if (!val || val.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(val)) return;
-          extractBalancedGQL(val).forEach(({ raw, name }) =>
-            addOp(raw, name, 'ast_string_literal'));
+          extractBalancedGQL(val).forEach(({ raw, name }) => addOp(raw, name, 'ast_string_literal'));
         },
-
         TemplateLiteral(nodePath) {
-          const text = nodePath.node.quasis
-            .map(q => q.value.cooked || q.value.raw || '')
-            .join('');
+          const text = nodePath.node.quasis.map(q => q.value.cooked || q.value.raw || '').join('');
           if (!text || text.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-          extractBalancedGQL(text).forEach(({ raw, name }) =>
-            addOp(raw, name, 'template_literal'));
+          extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'template_literal'));
         },
-
         CallExpression(nodePath) {
           const node = nodePath.node;
           const callee = node.callee;
-          const calleeName =
-            callee.name ||
-            (callee.property && callee.property.name) || '';
+          const calleeName = callee.name || (callee.property && callee.property.name) || '';
 
           if (HTTP_CLIENTS.has(calleeName)) {
             const bodyArg = node.arguments[1];
@@ -387,10 +544,8 @@ if (!isMainThread) {
               try {
                 const parsed = JSON.parse(bodyText);
                 const q = parsed.query || parsed.mutation;
-                if (q) {
-                  extractBalancedGQL(q).forEach(({ raw, name }) =>
-                    addOp(raw, name, 'http_client_json', parsed.variables || {}));
-                }
+                if (q) extractBalancedGQL(q).forEach(({ raw, name }) =>
+                  addOp(raw, name, 'http_client_json', parsed.variables || {}));
               } catch {
                 extractBalancedGQL(bodyText).forEach(({ raw, name }) =>
                   addOp(raw, name, 'http_client_body'));
@@ -427,66 +582,52 @@ if (!isMainThread) {
               addOp(raw, name, 'gql_function_call'));
           }
         },
-
         ObjectProperty(nodePath) {
-          const keyName =
-            (nodePath.node.key || {}).name ||
-            (nodePath.node.key || {}).value;
+          const keyName = (nodePath.node.key || {}).name || (nodePath.node.key || {}).value;
           if (!['query', 'mutation', 'subscription', 'document', 'gql'].includes(keyName)) return;
           const text = extractStringFromNode(nodePath.node.value);
           if (!text || !/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-          extractBalancedGQL(text).forEach(({ raw, name }) =>
-            addOp(raw, name, `object_prop_${keyName}`));
+          extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, `object_prop_${keyName}`));
         },
-
         AssignmentExpression(nodePath) {
           const right = nodePath.node.right;
           const text = extractStringFromNode(right);
           if (!text || text.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-          extractBalancedGQL(text).forEach(({ raw, name }) =>
-            addOp(raw, name, 'assignment'));
+          extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'assignment'));
         },
       });
     } catch (astErr) {
-      if (verbose) parentPort.postMessage({
-        log: `[AST] parse error in ${filePath}: ${astErr.message}`,
-      });
+      if (verbose) parentPort.postMessage({ log: `[AST] parse error in ${filePath}: ${astErr.message}` });
     }
 
-    // ── PASS 5: Comment scanning ──────────────────────────────────────────
     const COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
     let cm;
     while ((cm = COMMENT_RE.exec(code)) !== null) {
       const cleaned = cm[0].replace(/^\/\*+|\*+\/$/g, '').replace(/^\/\/\s*/gm, '');
-      extractBalancedGQL(cleaned).forEach(({ raw, name }) =>
-        addOp(raw, name, 'comment'));
+      extractBalancedGQL(cleaned).forEach(({ raw, name }) => addOp(raw, name, 'comment'));
     }
 
-    // ── PASS 6: Webpack / JSON-serialised queries (aggressive only) ───────
     if (aggressive) {
       const JSON_QUERY_RE = /["']query["']\s*:\s*["'`]((?:[^"'`\\]|\\.)*)["'`]/g;
       let jm;
       while ((jm = JSON_QUERY_RE.exec(code)) !== null) {
         const val = decodeEscapes(jm[1]);
         if (/\b(query|mutation|subscription|fragment)\b/i.test(val)) {
-          extractBalancedGQL(val).forEach(({ raw, name }) =>
-            addOp(raw, name, 'inline_json_query'));
+          extractBalancedGQL(val).forEach(({ raw, name }) => addOp(raw, name, 'inline_json_query'));
         }
       }
     }
 
     const result = Array.from(operations.values());
-    if (verbose && result.length > 0) {
-      parentPort.postMessage({ log: `[${filePath}] Found ${result.length} operations` });
-    }
+    if (verbose && result.length > 0) parentPort.postMessage({ log: `[${filePath}] Found ${result.length} operations` });
     parentPort.postMessage({ operations: result, filePath, origin: origin || filePath });
   });
 
   return;
 }
 
-// ─── AST string extractor ─────────────────────────────────────────────────────
+// ─── AST string extractor — UNCHANGED ────────────────────────────────────────
 function extractStringFromNode(node) {
   if (!node) return null;
   if (node.type === 'StringLiteral') return node.value;
@@ -502,16 +643,14 @@ function extractStringFromNode(node) {
   }
   if (node.type === 'TaggedTemplateExpression') {
     const tagName = node.tag.name || (node.tag.property && node.tag.property.name);
-    if (GQL_TAGS.has(tagName)) {
-      return node.quasi.quasis.map(q => q.value.cooked || '').join('');
-    }
+    if (GQL_TAGS.has(tagName)) return node.quasi.quasis.map(q => q.value.cooked || '').join('');
   }
   return null;
 }
 
-// ─── CLI setup ────────────────────────────────────────────────────────────────
+// ─── CLI setup — version bumped to 2.3.0, --verbose updated ──────────────────
 program
-  .version('2.2.0')
+  .version('2.3.0')
   .option('-i, --input <pattern>',    'Glob/file/URL for input files')
   .option('-o, --output <file>',      'Output JSON file (required)')
   .option('--url-list <file>',        'Text file containing JS URLs (one per line)')
@@ -519,14 +658,14 @@ program
   .option('--postman',                'Generate Postman collection')
   .option('--concurrency <n>',        'Max parallel files', parseInt, DEFAULT_CONCURRENCY)
   .option('--aggressive',             'Enable all detection passes (slower, catches more)')
-  .option('--verbose',                'Verbose logging')
+  .option('--verbose',                'Verbose logging — shows each introspection bypass attempt')
   .option('--headers <json>',         'JSON headers e.g. \'{"Authorization":"Bearer TOKEN","Cookie":"s=abc"}\'')
   .option('--retries <n>',            'Fetch retry attempts for remote files', parseInt, FETCH_RETRIES)
   .parse(process.argv);
 
 const options = program.opts();
 
-// ─── Parse --headers ──────────────────────────────────────────────────────────
+// ─── Parse --headers — UNCHANGED ─────────────────────────────────────────────
 let customHeaders = {};
 if (options.headers) {
   try {
@@ -540,9 +679,8 @@ if (options.headers) {
   }
 }
 
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ─── Validation — UNCHANGED ───────────────────────────────────────────────────
 function validateRequiredVariables() {
-  // At least one of --input, --url-list, or --endpoint must be provided
   if (!options.input && !options.urlList && !options.endpoint) {
     console.error('❌  --input, --url-list, or --endpoint is required');
     program.help({ error: true });
@@ -559,7 +697,7 @@ function validateRequiredVariables() {
 
 function isRemotePath(p) { return /^https?:\/\//.test(p); }
 
-// ─── Fetch with retry ─────────────────────────────────────────────────────────
+// ─── Fetch with retry — UNCHANGED ────────────────────────────────────────────
 async function fetchWithRetry(url) {
   const retries = options.retries ?? FETCH_RETRIES;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -569,11 +707,10 @@ async function fetchWithRetry(url) {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
       const res = await fetch(url, {
         signal: controller.signal,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.2)',
+          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.3)',
           'Accept': 'application/javascript, text/javascript, */*',
           'Accept-Encoding': 'gzip, deflate',
           ...customHeaders,
@@ -581,7 +718,6 @@ async function fetchWithRetry(url) {
         agent: new https.Agent({ family: 4, timeout: FETCH_TIMEOUT_MS }),
       });
       clearTimeout(timer);
-
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
       const code = await res.text();
       if (options.verbose) console.log(`✅ Fetched ${code.length.toLocaleString()} chars — ${url}`);
@@ -595,11 +731,10 @@ async function fetchWithRetry(url) {
   }
 }
 
-// ─── URL list processor ───────────────────────────────────────────────────────
+// ─── URL list processor — UNCHANGED ──────────────────────────────────────────
 async function processUrlList(filePath) {
   const urls = fs.readFileSync(filePath, 'utf8')
-    .split('\n')
-    .map(l => l.trim())
+    .split('\n').map(l => l.trim())
     .filter(l => l && !l.startsWith('#') && isRemotePath(l));
 
   if (!urls.length) { console.log('ℹ️  No valid URLs in list'); return []; }
@@ -616,21 +751,17 @@ async function processUrlList(filePath) {
       const fp = path.join(tempDir, name);
       fs.writeFileSync(fp, code);
       entries.push({ filePath: fp, origin: url });
-    } catch (e) {
-      console.error(`❌ ${url}: ${e.message}`);
-    }
+    } catch (e) { console.error(`❌ ${url}: ${e.message}`); }
   })));
 
   return entries;
 }
 
-// ─── Worker pool ──────────────────────────────────────────────────────────────
+// ─── Worker pool — UNCHANGED ──────────────────────────────────────────────────
 async function processFiles(fileEntries) {
   if (!fileEntries.length) return [];
 
-  const entries = fileEntries.map(e =>
-    typeof e === 'string' ? { filePath: e, origin: e } : e);
-
+  const entries = fileEntries.map(e => typeof e === 'string' ? { filePath: e, origin: e } : e);
   const bar = new cliProgress.SingleBar({
     format: '🚀 {bar} | {percentage}% | {value}/{total} files | ETA: {eta}s',
     hideCursor: true,
@@ -639,11 +770,8 @@ async function processFiles(fileEntries) {
 
   const allOps = new Map();
   const poolSize = Math.min(options.concurrency, entries.length);
-
-  const workerQueue = [];
-  const waitQueue = [];
-  let activeWorkers = 0;
-  let completedJobs = 0;
+  const workerQueue = [], waitQueue = [];
+  let activeWorkers = 0, completedJobs = 0;
   let resolveAll;
   const allDone = new Promise(r => { resolveAll = r; });
 
@@ -663,9 +791,7 @@ async function processFiles(fileEntries) {
     w.on('message', ({ operations, log }) => {
       if (log && options.verbose) process.stdout.write('\n' + log + '\n');
       if (operations) {
-        operations.forEach(op => {
-          if (!allOps.has(op.operation)) allOps.set(op.operation, op);
-        });
+        operations.forEach(op => { if (!allOps.has(op.operation)) allOps.set(op.operation, op); });
         bar.increment();
         completedJobs++;
         releaseWorker(w);
@@ -674,8 +800,7 @@ async function processFiles(fileEntries) {
     });
     w.on('error', err => {
       if (options.verbose) process.stderr.write(`\nWorker error: ${err.message}\n`);
-      bar.increment();
-      completedJobs++;
+      bar.increment(); completedJobs++;
       releaseWorker(w);
       if (completedJobs === entries.length) resolveAll();
     });
@@ -700,34 +825,25 @@ async function processFiles(fileEntries) {
   }
 
   const readLimit = pLimit(poolSize * 2);
-
   await Promise.all(entries.map(entry => readLimit(async () => {
     let code;
     try { code = await readFile(entry.filePath); }
     catch {
-      bar.increment();
-      completedJobs++;
+      bar.increment(); completedJobs++;
       if (completedJobs === entries.length) resolveAll();
       return;
     }
     const w = await acquireWorker();
-    w.postMessage({
-      filePath: entry.filePath,
-      code,
-      origin: entry.origin,
-      aggressive: !!options.aggressive,
-      verbose: !!options.verbose,
-    });
+    w.postMessage({ filePath: entry.filePath, code, origin: entry.origin, aggressive: !!options.aggressive, verbose: !!options.verbose });
   })));
 
   await allDone;
   workerQueue.forEach(w => w.terminate());
   bar.stop();
-
   return Array.from(allOps.values());
 }
 
-// ─── Postman collection generator ────────────────────────────────────────────
+// ─── Postman collection generator — UNCHANGED ────────────────────────────────
 function generatePostmanCollection(operations) {
   return {
     info: {
@@ -741,7 +857,7 @@ function generatePostmanCollection(operations) {
         method: 'POST',
         header: [
           { key: 'Content-Type', value: 'application/json' },
-          { key: 'Accept',       value: 'application/json' },
+          { key: 'Accept', value: 'application/json' },
           ...Object.entries(customHeaders).map(([k, v]) => ({ key: k, value: v })),
         ],
         body: {
@@ -768,14 +884,13 @@ function generatePostmanCollection(operations) {
   };
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main — only the introspection block changed ──────────────────────────────
 async function main() {
   validateRequiredVariables();
 
   let jsQueries = [];
   let tempDir = null;
 
-  // ── Step 1: JS extraction (if --input or --url-list provided) ────────────
   if (options.input || options.urlList) {
     let fileEntries = [];
 
@@ -807,19 +922,26 @@ async function main() {
     }
   }
 
-  // ── Step 2: Introspection (if --endpoint provided) ────────────────────────
   let finalQueries = jsQueries;
 
   if (options.endpoint) {
     try {
-      const introspectionData = await fetchIntrospectionSchema(options.endpoint, customHeaders);
-      const introspectionOps = extractOperationsFromSchema(introspectionData, options.endpoint);
-      console.log(`   Found ${introspectionOps.length} operations via introspection`);
+      // ── CHANGED: now destructures { data, isPartial } instead of just data
+      const { data: introspectionData, isPartial } = await fetchIntrospectionSchema(options.endpoint, customHeaders);
+
+      // ── CHANGED: routes to partial extractor if __schema was blocked
+      let introspectionOps;
+      if (isPartial) {
+        console.log('   ⚠️  Partial schema recovery via __type — full schema unavailable');
+        introspectionOps = extractOperationsFromType(introspectionData, options.endpoint);
+      } else {
+        introspectionOps = extractOperationsFromSchema(introspectionData, options.endpoint);
+      }
+
+      console.log(`   Found ${introspectionOps.length} operations via introspection${isPartial ? ' (partial)' : ''}`);
 
       if (jsQueries.length > 0) {
-        // Cross-reference JS ops against server schema
         const { taggedJs, hiddenOps } = crossReference(jsQueries, introspectionOps);
-
         const confirmed = taggedJs.filter(o => o.coverage === 'confirmed').length;
         const jsOnly    = taggedJs.filter(o => o.coverage === 'js_only').length;
 
@@ -835,13 +957,14 @@ async function main() {
 
         finalQueries = [...taggedJs, ...hiddenOps];
       } else {
-        // Pure introspection mode — no JS files
         finalQueries = introspectionOps;
         console.log(`   Pure introspection mode — ${introspectionOps.length} operations`);
       }
     } catch (err) {
-      console.error(`\n⚠️  Introspection failed: ${err.message}`);
-      console.error('   Continuing with JS extraction results only.');
+      // ── CHANGED: error message reflects that all bypasses were exhausted
+      console.error(`\n❌ Introspection failed: ${err.message}`);
+      console.error('   All bypass strategies exhausted. The endpoint may have introspection fully disabled.');
+      console.error('   Run with --verbose to see each bypass attempt.');
       if (options.verbose) console.error(err.stack);
     }
   }
@@ -851,16 +974,15 @@ async function main() {
     console.log('💡 Tips:');
     console.log('   • Try --aggressive for minified/bundled code');
     console.log('   • Add --endpoint to probe the server directly');
+    console.log('   • Use --verbose to see each bypass attempt');
     return;
   }
 
-  // ── Step 3: Output ────────────────────────────────────────────────────────
   const outDir  = path.dirname(options.output);
   const outBase = path.basename(options.output, '.json');
   const srcDir  = path.join(outDir, `${outBase}_sources`);
   fs.mkdirSync(srcDir, { recursive: true });
 
-  // Per-origin split files
   const byOrigin = {};
   finalQueries.forEach(op => {
     const k = op.origin || 'unknown';
@@ -871,16 +993,14 @@ async function main() {
     fs.writeFileSync(path.join(srcDir, name), JSON.stringify(ops, null, 2));
   });
 
-  // Combined output
   const enriched = finalQueries.map(q => ({
     ...q,
     detectedAt: q.detectedAt || new Date().toISOString(),
-    toolVersion: '2.2.0',
+    toolVersion: '2.3.0',
   }));
   fs.writeFileSync(options.output, JSON.stringify(enriched, null, 2));
   console.log(`\n✅ ${finalQueries.length} total operations → ${options.output}`);
 
-  // Detection breakdown
   const ctxSummary = {};
   finalQueries.forEach(q => { ctxSummary[q.context] = (ctxSummary[q.context] || 0) + 1; });
   console.log('\n📊 Detection breakdown:');
@@ -893,7 +1013,6 @@ async function main() {
     console.log(`\n📦 Postman collection → ${pmFile}`);
   }
 
-  // Cleanup temp dirs
   if (tempDir && tempDir.startsWith(os.tmpdir())) {
     try { fs.rmSync(tempDir, { recursive: true }); } catch {}
   }
