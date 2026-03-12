@@ -84,13 +84,34 @@ function extractVariablesFromSignature(operation) {
   return variables;
 }
 
+// ─── FIX 3a: inferDefaultValue now returns '' instead of 'sample-string' ──────
 function inferDefaultValue(type) {
   const t = type.replace(/[!\[\]]/g, '');
-  if (/String|ID|UUID/.test(t)) return 'sample-string';
+  if (/String|ID|UUID/.test(t)) return '';
   if (/Int|Float|Number/.test(t)) return 0;
   if (/Boolean/.test(t)) return false;
   if (/\[/.test(type)) return [];
   return null;
+}
+
+// ─── FIX 3b: NEW — walks InputObjectType and builds a populated object ────────
+function buildInputObject(inputType, visited = new Set()) {
+  if (!inputType || !inputType.getFields) return {};
+  const typeName = inputType.name;
+  if (visited.has(typeName)) return {};
+  visited.add(typeName);
+
+  const result = {};
+  for (const [fieldName, field] of Object.entries(inputType.getFields())) {
+    const named = unwrapType(field.type);
+    if (named.getFields) {
+      // Nested input object — recurse
+      result[fieldName] = buildInputObject(named, new Set(visited));
+    } else {
+      result[fieldName] = inferDefaultValue(String(field.type));
+    }
+  }
+  return result;
 }
 
 // ─── String decode helpers ────────────────────────────────────────────────────
@@ -125,15 +146,9 @@ function resolveStringConcatenation(code) {
 
 // ─── INTROSPECTION ────────────────────────────────────────────────────────────
 
-// ── NEW: Bypass strategy builder ──────────────────────────────────────────────
-// Returns ordered list of strategies to attempt when standard introspection fails.
-// Developers often block introspection by regex-matching "__schema{" — these
-// tricks exploit whitespace, encoding, HTTP method, and content-type differences
-// that bypass fragile regex filters.
 function buildBypassStrategies(endpoint) {
   const fullQuery = getIntrospectionQuery();
 
-  // __type fallback — partial schema recovery when __schema is fully blocked
   const typeQuery = `{
     __type(name: "Query") {
       fields {
@@ -146,7 +161,6 @@ function buildBypassStrategies(endpoint) {
   }`;
 
   return [
-    // ── Standard POST — always tried first ───────────────────────────────
     {
       label: 'Standard POST',
       method: 'POST',
@@ -154,9 +168,6 @@ function buildBypassStrategies(endpoint) {
       body: JSON.stringify({ query: fullQuery }),
       headers: { 'Content-Type': 'application/json' },
     },
-
-    // ── Bypass 1: newline between __schema and { ──────────────────────────
-    // Regex filters matching "__schema{" won't match "__schema\n{"
     {
       label: 'Bypass: newline after __schema',
       method: 'POST',
@@ -164,8 +175,6 @@ function buildBypassStrategies(endpoint) {
       body: JSON.stringify({ query: fullQuery.replace(/__schema\s*\{/g, '__schema\n{') }),
       headers: { 'Content-Type': 'application/json' },
     },
-
-    // ── Bypass 2: tab between __schema and { ─────────────────────────────
     {
       label: 'Bypass: tab after __schema',
       method: 'POST',
@@ -173,9 +182,6 @@ function buildBypassStrategies(endpoint) {
       body: JSON.stringify({ query: fullQuery.replace(/__schema\s*\{/g, '__schema\t{') }),
       headers: { 'Content-Type': 'application/json' },
     },
-
-    // ── Bypass 3: comma between __schema and { ────────────────────────────
-    // GraphQL parser ignores commas — regex filters typically don't account for them
     {
       label: 'Bypass: comma after __schema',
       method: 'POST',
@@ -183,9 +189,6 @@ function buildBypassStrategies(endpoint) {
       body: JSON.stringify({ query: fullQuery.replace(/__schema\s*\{/g, '__schema,{') }),
       headers: { 'Content-Type': 'application/json' },
     },
-
-    // ── Bypass 4: GET request with full query param ───────────────────────
-    // Introspection may only be blocked on POST
     {
       label: 'Bypass: GET request',
       method: 'GET',
@@ -193,8 +196,6 @@ function buildBypassStrategies(endpoint) {
       body: null,
       headers: { 'Accept': 'application/json' },
     },
-
-    // ── Bypass 5: GET with minimal probe ──────────────────────────────────
     {
       label: 'Bypass: GET minimal probe',
       method: 'GET',
@@ -202,9 +203,6 @@ function buildBypassStrategies(endpoint) {
       body: null,
       headers: { 'Accept': 'application/json' },
     },
-
-    // ── Bypass 6: application/graphql content-type ────────────────────────
-    // Raw query body with no JSON wrapper — some servers handle this differently
     {
       label: 'Bypass: application/graphql content-type',
       method: 'POST',
@@ -212,8 +210,6 @@ function buildBypassStrategies(endpoint) {
       body: fullQuery,
       headers: { 'Content-Type': 'application/graphql' },
     },
-
-    // ── Bypass 7: x-www-form-urlencoded ──────────────────────────────────
     {
       label: 'Bypass: form-urlencoded',
       method: 'POST',
@@ -221,9 +217,6 @@ function buildBypassStrategies(endpoint) {
       body: `query=${encodeURIComponent(fullQuery)}`,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     },
-
-    // ── Bypass 8: __type fallback (partial schema recovery) ───────────────
-    // When __schema is completely blocked, __type often still works
     {
       label: 'Bypass: __type partial recovery',
       method: 'POST',
@@ -232,8 +225,6 @@ function buildBypassStrategies(endpoint) {
       headers: { 'Content-Type': 'application/json' },
       isPartial: true,
     },
-
-    // ── Bypass 9: GET __type fallback ─────────────────────────────────────
     {
       label: 'Bypass: GET __type partial recovery',
       method: 'GET',
@@ -245,17 +236,12 @@ function buildBypassStrategies(endpoint) {
   ];
 }
 
-// ── NEW: Response validator ───────────────────────────────────────────────────
-// Checks if a parsed JSON response actually contains usable introspection data
 function isValidIntrospectionResponse(json) {
   if (!json || !json.data) return false;
   if (json.errors && !json.data.__schema && !json.data.__type) return false;
   return !!(json.data.__schema || json.data.__type);
 }
 
-// ── REPLACED: fetchIntrospectionSchema ───────────────────────────────────────
-// Old version did a single POST and threw on failure.
-// New version loops through all bypass strategies until one succeeds.
 async function fetchIntrospectionSchema(endpoint, headers) {
   console.log(`\n🔭 Running introspection on: ${endpoint}`);
 
@@ -271,9 +257,9 @@ async function fetchIntrospectionSchema(endpoint, headers) {
       const res = await fetch(strategy.url, {
         method: strategy.method,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.3)',
+          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.4)',
           ...strategy.headers,
-          ...headers, // user-supplied headers always win
+          ...headers,
         },
         ...(strategy.body ? { body: strategy.body } : {}),
         ...(agentOpts ? { agent: agentOpts } : {}),
@@ -308,7 +294,69 @@ async function fetchIntrospectionSchema(endpoint, headers) {
   throw new Error('All introspection strategies failed — endpoint may have introspection fully disabled');
 }
 
-// ── UNCHANGED: extractOperationsFromSchema ────────────────────────────────────
+// ─── unwrapType — must be defined before buildSelection and buildInputObject ──
+function unwrapType(type) {
+  if (type.ofType) return unwrapType(type.ofType);
+  return type;
+}
+
+// ─── FIX 2: Deep recursive field expansion with cycle guard ───────────────────
+// Old buildSelection only went 2 levels deep and emitted only scalar fields,
+// producing skeletal queries missing all nested objects.
+// New version recurses to depth 4 (matching the traditional tool output),
+// emits ALL fields (scalars inline, objects recursed), and uses a visited-set
+// cycle guard so circular schema references get a safe __typename placeholder
+// instead of infinite recursion.
+function buildSelection(type, depth, indent = 2, visited = new Set()) {
+  if (depth === 0) return '';
+  const named = unwrapType(type);
+  if (!named.getFields) return '';
+
+  // Cycle guard — if we've already expanded this type in this call stack,
+  // emit a __typename placeholder so the query stays syntactically valid.
+  const typeName = named.name;
+  if (visited.has(typeName)) {
+    return ` {\n${' '.repeat(indent)}__typename\n${' '.repeat(indent - 2)}}`;
+  }
+  visited.add(typeName);
+
+  try {
+    const fields = named.getFields();
+    const pad = ' '.repeat(indent);
+    const lines = [];
+
+    for (const [fieldName, field] of Object.entries(fields)) {
+      const fieldNamed = unwrapType(field.type);
+      if (fieldNamed.getFields) {
+        // Object/interface type — recurse one level deeper
+        const nested = buildSelection(field.type, depth - 1, indent + 2, new Set(visited));
+        if (nested) {
+          lines.push(`${pad}${fieldName}${nested}`);
+        } else {
+          // depth ran out — keep query valid with __typename placeholder
+          lines.push(`${pad}${fieldName} {\n${pad}  __typename\n${pad}}`);
+        }
+      } else {
+        // Scalar or enum — emit directly
+        lines.push(`${pad}${fieldName}`);
+      }
+    }
+
+    if (!lines.length) return '';
+    return ` {\n${lines.join('\n')}\n${' '.repeat(indent - 2)}}`;
+  } catch {
+    return '';
+  } finally {
+    visited.delete(typeName);
+  }
+}
+
+// ─── FIX 1 + FIX 3: extractOperationsFromSchema ───────────────────────────────
+// FIX 1 — Anonymous mutations: removed operation name from the raw string so
+//   output matches `mutation($input: T!) { ... }` not `mutation AcceptFoo(...)`
+// FIX 2 — buildSelection call now passes depth=4 and a fresh visited Set
+// FIX 3 — variables block now calls buildInputObject for InputObjectTypes
+//   so variables are fully populated instead of being set to null
 function extractOperationsFromSchema(introspectionData, endpoint) {
   const schema = buildClientSchema(introspectionData);
   const ops = [];
@@ -330,13 +378,25 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
       const argPass = args.length
         ? `(${args.map(a => `${a.name}: $${a.name}`).join(', ')})`
         : '';
-      const selection = buildSelection(field.type, 2);
-      const raw = `${opType} ${capitalise(fieldName)}${argSignature} {\n  ${fieldName}${argPass}${selection}\n}`;
+
+      // FIX 1: no operation name — anonymous style matches traditional tool output
+      // FIX 2: depth=4, fresh visited Set for each top-level field
+      const selection = buildSelection(field.type, 4, 2, new Set());
+      const raw = `${opType}${argSignature} {\n  ${fieldName}${argPass}${selection}\n}`;
       const normalised = validateAndNormalise(raw);
       if (!normalised) continue;
 
+      // FIX 3: populate input variables by walking the InputObjectType from schema
       const variables = {};
-      args.forEach(a => { variables[a.name] = inferDefaultValue(String(a.type)); });
+      args.forEach(a => {
+        const named = unwrapType(a.type);
+        if (named.getFields) {
+          // InputObjectType — expand all its fields recursively
+          variables[a.name] = buildInputObject(named, new Set());
+        } else {
+          variables[a.name] = inferDefaultValue(String(a.type));
+        }
+      });
 
       ops.push({
         operation: normalised,
@@ -346,7 +406,7 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
         origin: endpoint,
         context: 'introspection',
         detectedAt: new Date().toISOString(),
-        toolVersion: '2.3.0',
+        toolVersion: '2.4.0',
       });
     }
   }
@@ -354,9 +414,7 @@ function extractOperationsFromSchema(introspectionData, endpoint) {
   return ops;
 }
 
-// ── NEW: extractOperationsFromType ────────────────────────────────────────────
-// Used when __schema is blocked but __type partial recovery succeeds.
-// Builds minimal query skeletons from the field list returned by __type.
+// ─── extractOperationsFromType (partial __type recovery — unchanged) ──────────
 function extractOperationsFromType(typeData, endpoint) {
   if (!typeData.__type || !typeData.__type.fields) return [];
   const ops = [];
@@ -375,7 +433,7 @@ function extractOperationsFromType(typeData, endpoint) {
     if (!normalised) continue;
 
     const variables = {};
-    args.forEach(a => { variables[a.name] = 'sample-string'; });
+    args.forEach(a => { variables[a.name] = ''; });
 
     ops.push({
       operation: normalised,
@@ -385,32 +443,11 @@ function extractOperationsFromType(typeData, endpoint) {
       origin: endpoint,
       context: 'introspection_partial',
       detectedAt: new Date().toISOString(),
-      toolVersion: '2.3.0',
+      toolVersion: '2.4.0',
     });
   }
 
   return ops;
-}
-
-// ── UNCHANGED ─────────────────────────────────────────────────────────────────
-function unwrapType(type) {
-  if (type.ofType) return unwrapType(type.ofType);
-  return type;
-}
-
-function buildSelection(type, depth) {
-  if (depth === 0) return '';
-  const named = unwrapType(type);
-  if (!named.getFields) return '';
-  try {
-    const fields = named.getFields();
-    const scalarFields = Object.entries(fields)
-      .filter(([, f]) => !unwrapType(f.type).getFields)
-      .slice(0, 5)
-      .map(([name]) => name);
-    if (!scalarFields.length) return '';
-    return ` {\n    ${scalarFields.join('\n    ')}\n  }`;
-  } catch { return ''; }
 }
 
 function capitalise(str) {
@@ -648,9 +685,9 @@ function extractStringFromNode(node) {
   return null;
 }
 
-// ─── CLI setup — version bumped to 2.3.0, --verbose updated ──────────────────
+// ─── CLI setup ────────────────────────────────────────────────────────────────
 program
-  .version('2.3.0')
+  .version('2.4.0')
   .option('-i, --input <pattern>',    'Glob/file/URL for input files')
   .option('-o, --output <file>',      'Output JSON file (required)')
   .option('--url-list <file>',        'Text file containing JS URLs (one per line)')
@@ -665,7 +702,7 @@ program
 
 const options = program.opts();
 
-// ─── Parse --headers — UNCHANGED ─────────────────────────────────────────────
+// ─── Parse --headers ──────────────────────────────────────────────────────────
 let customHeaders = {};
 if (options.headers) {
   try {
@@ -679,7 +716,7 @@ if (options.headers) {
   }
 }
 
-// ─── Validation — UNCHANGED ───────────────────────────────────────────────────
+// ─── Validation ───────────────────────────────────────────────────────────────
 function validateRequiredVariables() {
   if (!options.input && !options.urlList && !options.endpoint) {
     console.error('❌  --input, --url-list, or --endpoint is required');
@@ -697,7 +734,7 @@ function validateRequiredVariables() {
 
 function isRemotePath(p) { return /^https?:\/\//.test(p); }
 
-// ─── Fetch with retry — UNCHANGED ────────────────────────────────────────────
+// ─── Fetch with retry ─────────────────────────────────────────────────────────
 async function fetchWithRetry(url) {
   const retries = options.retries ?? FETCH_RETRIES;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -710,7 +747,7 @@ async function fetchWithRetry(url) {
       const res = await fetch(url, {
         signal: controller.signal,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.3)',
+          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.4)',
           'Accept': 'application/javascript, text/javascript, */*',
           'Accept-Encoding': 'gzip, deflate',
           ...customHeaders,
@@ -731,7 +768,7 @@ async function fetchWithRetry(url) {
   }
 }
 
-// ─── URL list processor — UNCHANGED ──────────────────────────────────────────
+// ─── URL list processor ───────────────────────────────────────────────────────
 async function processUrlList(filePath) {
   const urls = fs.readFileSync(filePath, 'utf8')
     .split('\n').map(l => l.trim())
@@ -757,7 +794,7 @@ async function processUrlList(filePath) {
   return entries;
 }
 
-// ─── Worker pool — UNCHANGED ──────────────────────────────────────────────────
+// ─── Worker pool ──────────────────────────────────────────────────────────────
 async function processFiles(fileEntries) {
   if (!fileEntries.length) return [];
 
@@ -843,7 +880,7 @@ async function processFiles(fileEntries) {
   return Array.from(allOps.values());
 }
 
-// ─── Postman collection generator — UNCHANGED ────────────────────────────────
+// ─── Postman collection generator ────────────────────────────────────────────
 function generatePostmanCollection(operations) {
   return {
     info: {
@@ -884,7 +921,7 @@ function generatePostmanCollection(operations) {
   };
 }
 
-// ─── Main — only the introspection block changed ──────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   validateRequiredVariables();
 
@@ -926,10 +963,8 @@ async function main() {
 
   if (options.endpoint) {
     try {
-      // ── CHANGED: now destructures { data, isPartial } instead of just data
       const { data: introspectionData, isPartial } = await fetchIntrospectionSchema(options.endpoint, customHeaders);
 
-      // ── CHANGED: routes to partial extractor if __schema was blocked
       let introspectionOps;
       if (isPartial) {
         console.log('   ⚠️  Partial schema recovery via __type — full schema unavailable');
@@ -961,7 +996,6 @@ async function main() {
         console.log(`   Pure introspection mode — ${introspectionOps.length} operations`);
       }
     } catch (err) {
-      // ── CHANGED: error message reflects that all bypasses were exhausted
       console.error(`\n❌ Introspection failed: ${err.message}`);
       console.error('   All bypass strategies exhausted. The endpoint may have introspection fully disabled.');
       console.error('   Run with --verbose to see each bypass attempt.');
@@ -996,7 +1030,7 @@ async function main() {
   const enriched = finalQueries.map(q => ({
     ...q,
     detectedAt: q.detectedAt || new Date().toISOString(),
-    toolVersion: '2.3.0',
+    toolVersion: '2.4.0',
   }));
   fs.writeFileSync(options.output, JSON.stringify(enriched, null, 2));
   console.log(`\n✅ ${finalQueries.length} total operations → ${options.output}`);
