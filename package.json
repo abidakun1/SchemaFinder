@@ -1,7 +1,7 @@
 {
   "name": "schemafinder",
-  "version": "2.3.0",
-  "description": "Find and extract GraphQL operations from JavaScript files and endpoints — with introspection bypass",
+  "version": "2.4.0",
+  "description": "Find and extract GraphQL operations from JavaScript files and endpoints — with introspection bypass and Babel scope-aware variable resolution",
   "main": "schemafinder.js",
   "bin": {
     "schemafinder": "./schemafinder.js"
@@ -19,7 +19,86 @@
     "ast",
     "extractor",
     "introspection",
-    "bypass"
+    "bypass",
+    "scope-analysis"
+  ],
+  "author": "abidakun1",
+  "license": "MIT",
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "@babel/traverse": "^7.24.0",
+    "cli-progress": "^3.12.0",
+    "commander": "^12.0.0",
+    "fast-glob": "^3.3.2",
+    "graphql": "^16.8.1",
+    "node-fetch": "^2.7.0",
+    "p-limit": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}{
+  "name": "schemafinder",
+  "version": "2.4.0",
+  "description": "Find and extract GraphQL operations from JavaScript files and endpoints — with introspection bypass and Babel scope-aware variable resolution",
+  "main": "schemafinder.js",
+  "bin": {
+    "schemafinder": "./schemafinder.js"
+  },
+  "scripts": {
+    "start": "node schemafinder.js"
+  },
+  "keywords": [
+    "graphql",
+    "recon",
+    "security",
+    "bugbounty",
+    "static-analysis",
+    "pentesting",
+    "ast",
+    "extractor",
+    "introspection",
+    "bypass",
+    "scope-analysis"
+  ],
+  "author": "abidakun1",
+  "license": "MIT",
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "@babel/traverse": "^7.24.0",
+    "cli-progress": "^3.12.0",
+    "commander": "^12.0.0",
+    "fast-glob": "^3.3.2",
+    "graphql": "^16.8.1",
+    "node-fetch": "^2.7.0",
+    "p-limit": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}{
+  "name": "schemafinder",
+  "version": "2.4.0",
+  "description": "Find and extract GraphQL operations from JavaScript files and endpoints — with introspection bypass and Babel scope-aware variable resolution",
+  "main": "schemafinder.js",
+  "bin": {
+    "schemafinder": "./schemafinder.js"
+  },
+  "scripts": {
+    "start": "node schemafinder.js"
+  },
+  "keywords": [
+    "graphql",
+    "recon",
+    "security",
+    "bugbounty",
+    "static-analysis",
+    "pentesting",
+    "ast",
+    "extractor",
+    "introspection",
+    "bypass",
+    "scope-analysis"
   ],
   "author": "abidakun1",
   "license": "MIT",
