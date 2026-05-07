@@ -3,7 +3,12 @@
 A Node.js CLI tool for extracting GraphQL operations from JavaScript code, including support for minified/bundled code and remote file analysis — optimized for JS auditing and recon. Inspired by  [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
 
 
+# How it works
 
+SchemaFinder has two complementary modes that can run independently or together:
+JS extraction scans JavaScript source files (local or remote) using a three-pass Babel AST engine to pull every GraphQL query, mutation, subscription, and fragment — including operations buried in string concatenation, variable bindings, HTTP client bodies, React/Apollo hooks, and encoded or commented-out code.
+Live introspection probes a GraphQL endpoint directly. If standard introspection is blocked, it automatically tries 10 bypass strategies and falls back to partial __type recovery if the schema is locked down entirely.
+When both modes run together, results are cross-referenced to surface hidden server-only operations — endpoints the backend exposes that the frontend never calls, and that JS-only tools will never find.
 
 ## Features
 
@@ -75,10 +80,7 @@ A Node.js CLI tool for extracting GraphQL operations from JavaScript code, inclu
 - Read-ahead buffering decoupled from worker availability
 - CLI progress bar with real-time ETA
 - Configurable concurrency
-  
-✅ Plugin System for Custom AST Visitors:
 
-- Extensible with plugins for custom Abstract Syntax Tree (AST) visitors, allowing users to add custom logic or handle specific GraphQL patterns.
 
 
 
