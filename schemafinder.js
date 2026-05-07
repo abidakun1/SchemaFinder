@@ -470,7 +470,7 @@ function crossReference(jsOps, introspectionOps) {
   return { taggedJs, hiddenOps };
 }
 
-// ─── Worker logic — UNCHANGED ─────────────────────────────────────────────────
+// ─── Worker logic ─────────────────────────────────────────────────────────────
 if (!isMainThread) {
   parentPort.on('message', ({ filePath, code, origin, aggressive, verbose }) => {
     const operations = new Map();
@@ -531,6 +531,60 @@ if (!isMainThread) {
       }
     }
 
+    // ── Scope binding map — populated in Pass 1, consumed in Pass 2 ──────────
+    // Maps identifier name → statically-resolved string value.
+    // This is what enables real variable binding resolution: when we see
+    //   const FRAG = `fragment F on T { id }`;
+    //   const QUERY = `query Q { ...F }` + FRAG;
+    // we record FRAG → its string value in Pass 1, then in Pass 2 any
+    // Identifier node whose name is in the map gets substituted, so the
+    // BinaryExpression / TemplateLiteral resolvers can stitch the full query.
+    const scopeBindings = new Map();
+
+    // Resolves an AST node to its static string value, substituting known
+    // variable bindings for Identifier nodes (Babel scope analysis).
+    function extractStringScoped(node, depth = 0) {
+      if (!node || depth > 10) return null;
+      if (node.type === 'StringLiteral') return node.value;
+      if (node.type === 'NumericLiteral') return String(node.value);
+      if (node.type === 'TemplateLiteral') {
+        const parts = [];
+        node.quasis.forEach((q, i) => {
+          parts.push(q.value.cooked ?? q.value.raw ?? '');
+          if (i < node.expressions.length) {
+            const v = extractStringScoped(node.expressions[i], depth + 1);
+            parts.push(v !== null ? v : '');
+          }
+        });
+        return parts.join('');
+      }
+      if (node.type === 'BinaryExpression' && node.operator === '+') {
+        const left  = extractStringScoped(node.left,  depth + 1);
+        const right = extractStringScoped(node.right, depth + 1);
+        if (left !== null && right !== null) return left + right;
+        return left ?? right;
+      }
+      // ← This is the key addition: resolve identifier references via scope map
+      if (node.type === 'Identifier' && scopeBindings.has(node.name)) {
+        return scopeBindings.get(node.name);
+      }
+      if (node.type === 'TaggedTemplateExpression') {
+        const tagName = node.tag.name || (node.tag.property && node.tag.property.name);
+        if (GQL_TAGS.has(tagName)) {
+          const parts = [];
+          node.quasi.quasis.forEach((q, i) => {
+            parts.push(q.value.cooked ?? q.value.raw ?? '');
+            if (i < node.quasi.expressions.length) {
+              const v = extractStringScoped(node.quasi.expressions[i], depth + 1);
+              parts.push(v !== null ? v : '');
+            }
+          });
+          return parts.join('');
+        }
+      }
+      return null;
+    }
+
     try {
       const ast = parser.parse(code, {
         sourceType: 'unambiguous',
@@ -548,12 +602,37 @@ if (!isMainThread) {
         errorRecovery: true,
       });
 
+      // ── Pass 1: build scope binding map using Babel's scope API ─────────────
+      // nodePath.scope.getBinding(name) confirms the identifier is a real
+      // variable declaration in Babel's scope graph (not a free reference),
+      // giving us accurate binding resolution rather than naive name matching.
+      traverse(ast, {
+        VariableDeclarator(nodePath) {
+          const { id, init } = nodePath.node;
+          if (!init || id.type !== 'Identifier') return;
+          // Use Babel scope API to confirm this is the canonical binding site
+          const binding = nodePath.scope.getBinding(id.name);
+          if (!binding) return;
+          const val = extractStringScoped(init);
+          if (val !== null) scopeBindings.set(id.name, val);
+        },
+        AssignmentExpression(nodePath) {
+          const { left, right } = nodePath.node;
+          if (left.type !== 'Identifier') return;
+          const val = extractStringScoped(right);
+          if (val !== null) scopeBindings.set(left.name, val);
+        },
+      });
+
+      // ── Pass 2: extract GraphQL operations with full variable resolution ─────
       traverse(ast, {
         TaggedTemplateExpression(nodePath) {
           const tag = nodePath.node.tag;
           const tagName = tag.name || (tag.property && tag.property.name) || (tag.callee && tag.callee.name);
           if (!tagName || !GQL_TAGS.has(tagName)) return;
-          const text = nodePath.node.quasi.quasis.map(q => q.value.cooked || q.value.raw || '').join('__EXPR__');
+          // Use scoped resolver so interpolated variables are substituted
+          const text = extractStringScoped(nodePath.node) ||
+            nodePath.node.quasi.quasis.map(q => q.value.cooked || q.value.raw || '').join('__EXPR__');
           extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'tagged_template'));
         },
         StringLiteral(nodePath) {
@@ -563,7 +642,9 @@ if (!isMainThread) {
           extractBalancedGQL(val).forEach(({ raw, name }) => addOp(raw, name, 'ast_string_literal'));
         },
         TemplateLiteral(nodePath) {
-          const text = nodePath.node.quasis.map(q => q.value.cooked || q.value.raw || '').join('');
+          // Use scoped resolver: expressions that reference bound variables get filled in
+          const text = extractStringScoped(nodePath.node) ||
+            nodePath.node.quasis.map(q => q.value.cooked || q.value.raw || '').join('');
           if (!text || text.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
           extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'template_literal'));
@@ -576,7 +657,7 @@ if (!isMainThread) {
           if (HTTP_CLIENTS.has(calleeName)) {
             const bodyArg = node.arguments[1];
             if (!bodyArg) return;
-            const bodyText = extractStringFromNode(bodyArg);
+            const bodyText = extractStringScoped(bodyArg);
             if (bodyText) {
               try {
                 const parsed = JSON.parse(bodyText);
@@ -593,7 +674,7 @@ if (!isMainThread) {
           if (/^use(Query|Mutation|Subscription|LazyQuery)$/.test(calleeName)) {
             const queryArg = node.arguments[0];
             if (queryArg) {
-              const text = extractStringFromNode(queryArg);
+              const text = extractStringScoped(queryArg);
               if (text) extractBalancedGQL(text).forEach(({ raw, name }) =>
                 addOp(raw, name, `hook_${calleeName}`));
             }
@@ -606,7 +687,7 @@ if (!isMainThread) {
                 ['query', 'mutation', 'subscription', 'document'].includes(
                   (p.key || {}).name || (p.key || {}).value));
               if (qProp) {
-                const text = extractStringFromNode(qProp.value);
+                const text = extractStringScoped(qProp.value);
                 if (text) extractBalancedGQL(text).forEach(({ raw, name }) =>
                   addOp(raw, name, `client_${calleeName}`));
               }
@@ -614,7 +695,7 @@ if (!isMainThread) {
           }
 
           if (GQL_TAGS.has(calleeName) && node.arguments.length > 0) {
-            const text = extractStringFromNode(node.arguments[0]);
+            const text = extractStringScoped(node.arguments[0]);
             if (text) extractBalancedGQL(text).forEach(({ raw, name }) =>
               addOp(raw, name, 'gql_function_call'));
           }
@@ -622,18 +703,28 @@ if (!isMainThread) {
         ObjectProperty(nodePath) {
           const keyName = (nodePath.node.key || {}).name || (nodePath.node.key || {}).value;
           if (!['query', 'mutation', 'subscription', 'document', 'gql'].includes(keyName)) return;
-          const text = extractStringFromNode(nodePath.node.value);
+          const text = extractStringScoped(nodePath.node.value);
           if (!text || !/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
           extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, `object_prop_${keyName}`));
         },
         AssignmentExpression(nodePath) {
           const right = nodePath.node.right;
-          const text = extractStringFromNode(right);
+          const text = extractStringScoped(right);
           if (!text || text.length < 15) return;
           if (!/\b(query|mutation|subscription|fragment)\b/i.test(text)) return;
-          extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'assignment'));
+          extractBalancedGQL(text).forEach(({ raw, name }) => addOp(raw, name, 'scope_assignment'));
         },
       });
+
+      // ── Pass 3: sweep all resolved bindings for GQL ops ───────────────────
+      // Catches cases where the assembled query is only ever stored in a
+      // variable and passed around — never directly to a known call site.
+      for (const [, val] of scopeBindings) {
+        if (!val || val.length < 15) continue;
+        if (!/\b(query|mutation|subscription|fragment)\b/i.test(val)) continue;
+        extractBalancedGQL(val).forEach(({ raw, name }) => addOp(raw, name, 'scope_binding'));
+      }
+
     } catch (astErr) {
       if (verbose) parentPort.postMessage({ log: `[AST] parse error in ${filePath}: ${astErr.message}` });
     }
