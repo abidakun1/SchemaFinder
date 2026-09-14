@@ -8,7 +8,7 @@ A Node.js CLI tool for extracting GraphQL operations from JavaScript code, inclu
 SchemaFinder has two complementary modes that can run independently or together:
 JS extraction scans JavaScript source files (local or remote) using a three-pass Babel AST engine to pull every GraphQL query, mutation, subscription, and fragment — including operations buried in string concatenation, variable bindings, HTTP client bodies, React/Apollo hooks, and encoded or commented-out code.
 
-Live introspection probes a GraphQL endpoint directly. If standard introspection is blocked, it automatically tries 10 bypass strategies and falls back to partial __type recovery if the schema is locked down entirely.
+Live introspection probes a GraphQL endpoint directly. If standard introspection is blocked, it automatically tries 10 bypass strategies and falls back to partial __type recovery if the schema is locked down entirely. Every strategy is attempted both **unauthenticated and authenticated** (when credentials are supplied), since some servers expose introspection only to anonymous callers and others only to logged-in ones. Non-standard introspection responses — for example graphql-java backends that omit fields graphql-js expects (`args` on directives, `interfaces` on objects, etc.) — are normalised automatically so the schema still builds instead of crashing.
 
 When both modes run together, results are cross-referenced to surface hidden server-only operations — endpoints the backend exposes that the frontend never calls, and that JS-only tools will never find.
 
@@ -16,12 +16,13 @@ When both modes run together, results are cross-referenced to surface hidden ser
 
 
 - **Multi-source extraction** — tagged templates (`gql`, `graphql`, `apollo`), inline HTTP calls (`fetch`, `axios`), string literals, template literals, commented-out queries
-- **Live introspection** — probe a GraphQL endpoint directly to discover every operation the server exposes
-- **Introspection bypass engine** — automatically tries 9 strategies when standard introspection is blocked: whitespace tricks, GET requests, alternative content-types, and `__type` partial recovery
+- **Live introspection** — probe a GraphQL endpoint directly to discover every operation the server exposes; each attempt runs both **unauthenticated and authenticated**
+- **Introspection bypass engine** — automatically tries 10 strategies when standard introspection is blocked: whitespace tricks, GET requests, alternative content-types, and `__type` partial recovery
+- **Non-standard schema tolerance** — normalises introspection results from servers (e.g. graphql-java) that omit fields graphql-js requires, so recon doesn't crash on `missing directive args` / `missing interfaces` errors
 - **Cross-referencing** — compare JS extraction vs live server schema to produce a coverage report: confirmed, JS-only, and hidden server-only operations
 - **Real GQL validation** — every candidate parsed through `graphql`'s own parser, eliminating false positives
 - **Minified/bundled code** — specialised passes for compressed JavaScript with `--aggressive` mode
-- **Auth header support** — pass `Authorization`, `Cookie`, or any custom headers via `--headers`
+- **Auth support** — bearer token via `--auth`, cookie via `--cookie` (usable together), or any custom headers via `--headers`
 - **Retry with backoff** — remote fetches retry with exponential backoff + jitter
 - **Batch processing** — process a list of URLs in parallel via `--url-list`
 - **Postman export** — ready-to-use collection with auth headers and pre-filled endpoint URL
@@ -114,9 +115,22 @@ schemafinder -i "https://example.com/static/js/main.chunk.js" -o queries.json
 
 ### Authenticated remote scan
 ```bash
+# Bearer token shortcut (adds "Authorization: Bearer TOKEN")
+schemafinder -i "https://app.example.com/main.chunk.js" -o results.json \
+  --auth "TOKEN"
+
+# Or via raw headers
 schemafinder -i "https://app.example.com/main.chunk.js" -o results.json \
   --headers '{"Authorization":"Bearer TOKEN"}'
 ```
+
+### Bearer token + cookie together
+```bash
+schemafinder --endpoint https://api.example.com/graphql -o results.json \
+  --auth "TOKEN" \
+  --cookie "session=abc; csrf=xyz"
+```
+`--auth`, `--cookie`, and `--headers` can all be combined; `--headers` wins if it sets the same key.
 
 ### Batch URL processing
 ```bash
@@ -125,9 +139,12 @@ schemafinder --url-list urls.txt -o queries.json
 
 ### Introspection only — probe the server directly
 ```bash
-schemafinder --endpoint https://api.example.com/graphql \
-  -o results.json \
-  --headers '{"Authorization":"Bearer TOKEN"}'
+# No credentials needed — introspection is also attempted unauthenticated
+schemafinder --endpoint https://api.example.com/graphql -o results.json
+
+# With auth (still tries unauthenticated first, then authenticated)
+schemafinder --endpoint https://api.example.com/graphql -o results.json \
+  --auth "TOKEN"
 ```
 
 ### Introspection + Postman export
@@ -172,7 +189,9 @@ schemafinder -i "dist/*.min.js" -o queries.json --aggressive
 | `--postman` | Export results as a Postman collection | false |
 | `--concurrency <n>` | Max parallel worker threads | 4 |
 | `--aggressive` | Enable all detection passes (slower, catches more) | false |
-| `--headers <json>` | JSON object of custom request headers | — |
+| `--auth <token>` | Bearer token — sent as `Authorization: Bearer <token>` (combines with `--cookie`) | — |
+| `--cookie <string>` | Cookie header value — sent as `Cookie: <string>` (combines with `--auth`) | — |
+| `--headers <json>` | JSON object of custom request headers (overrides `--auth`/`--cookie` on key clash) | — |
 | `--retries <n>` | Retry attempts for failed remote fetches | 3 |
 | `--verbose` | Verbose logging | false |
 
@@ -182,7 +201,7 @@ schemafinder -i "dist/*.min.js" -o queries.json --aggressive
 
 ## Introspection & Bypass
 
-When `--endpoint` is provided, SchemaFinder sends a full introspection query. If blocked, it automatically tries 9 bypass strategies:
+When `--endpoint` is provided, SchemaFinder sends a full introspection query. If blocked, it automatically tries 10 bypass strategies:
 
 | # | Strategy | What it exploits |
 |---|----------|-----------------|
@@ -194,9 +213,14 @@ When `--endpoint` is provided, SchemaFinder sends a full introspection query. If
 | 6 | GET minimal probe | Smaller fingerprint |
 | 7 | `application/graphql` content-type | Raw body, no JSON wrapper |
 | 8 | `x-www-form-urlencoded` | Alternative encoding |
-| 9 | `__type` partial recovery | When `__schema` is fully blocked |
+| 9 | `__type` partial recovery (POST) | When `__schema` is fully blocked |
+| 10 | `__type` partial recovery (GET) | Same, over GET |
 
-Use `--verbose` to see each attempt in real time.
+**Dual auth mode:** every strategy is run **unauthenticated first, then authenticated** when you supply credentials (`--auth`, `--cookie`, or `--headers`) — because some endpoints only expose introspection to anonymous callers and others only to authenticated ones. The success line names which mode worked, e.g. `✅ Introspection succeeded via: Standard POST (authenticated)`.
+
+**Non-standard responses:** results from servers that omit fields graphql-js insists on (common with graphql-java — e.g. directives without `args`, objects without `interfaces`) are normalised before the schema is built, so introspection no longer dies with `Introspection result missing ...` errors.
+
+Use `--verbose` to see each attempt (and its auth mode) in real time.
 
 When used alongside `--input` or `--url-list`, results are cross-referenced:
 ```
