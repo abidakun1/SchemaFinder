@@ -250,44 +250,55 @@ async function fetchIntrospectionSchema(endpoint, headers) {
     ? new https.Agent({ family: 4, timeout: FETCH_TIMEOUT_MS })
     : undefined;
 
-  for (const strategy of strategies) {
-    try {
-      if (options.verbose) process.stdout.write(`   trying ${strategy.label}... `);
+  // ─── FIX 2: attempt introspection both unauthenticated AND authenticated ───
+  // Some endpoints expose introspection only to anonymous callers, others only
+  // to authenticated ones. Try each strategy anonymously first, then (if auth
+  // headers were supplied) replay it with those headers. Whichever works wins.
+  const hasAuth = headers && Object.keys(headers).length > 0;
+  const authModes = hasAuth
+    ? [{ label: 'unauthenticated', headers: {} }, { label: 'authenticated', headers }]
+    : [{ label: 'unauthenticated', headers: {} }];
 
-      const res = await fetch(strategy.url, {
-        method: strategy.method,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.4)',
-          ...strategy.headers,
-          ...headers,
-        },
-        ...(strategy.body ? { body: strategy.body } : {}),
-        ...(agentOpts ? { agent: agentOpts } : {}),
-      });
+  for (const authMode of authModes) {
+    for (const strategy of strategies) {
+      try {
+        if (options.verbose) process.stdout.write(`   trying ${strategy.label} [${authMode.label}]... `);
 
-      if (!res.ok) {
-        if (options.verbose) console.log(`HTTP ${res.status}`);
+        const res = await fetch(strategy.url, {
+          method: strategy.method,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; SchemaFinder/2.4)',
+            ...strategy.headers,
+            ...authMode.headers,
+          },
+          ...(strategy.body ? { body: strategy.body } : {}),
+          ...(agentOpts ? { agent: agentOpts } : {}),
+        });
+
+        if (!res.ok) {
+          if (options.verbose) console.log(`HTTP ${res.status}`);
+          continue;
+        }
+
+        let json;
+        try { json = await res.json(); }
+        catch {
+          if (options.verbose) console.log('non-JSON response');
+          continue;
+        }
+
+        if (!isValidIntrospectionResponse(json)) {
+          if (options.verbose) console.log('blocked or empty');
+          continue;
+        }
+
+        console.log(`\n   ✅ Introspection succeeded via: ${strategy.label} (${authMode.label})`);
+        return { data: json.data, isPartial: !!strategy.isPartial };
+
+      } catch (err) {
+        if (options.verbose) console.log(`error: ${err.message}`);
         continue;
       }
-
-      let json;
-      try { json = await res.json(); }
-      catch {
-        if (options.verbose) console.log('non-JSON response');
-        continue;
-      }
-
-      if (!isValidIntrospectionResponse(json)) {
-        if (options.verbose) console.log('blocked or empty');
-        continue;
-      }
-
-      console.log(`\n   ✅ Introspection succeeded via: ${strategy.label}`);
-      return { data: json.data, isPartial: !!strategy.isPartial };
-
-    } catch (err) {
-      if (options.verbose) console.log(`error: ${err.message}`);
-      continue;
     }
   }
 
@@ -357,8 +368,69 @@ function buildSelection(type, depth, indent = 2, visited = new Set()) {
 // FIX 2 — buildSelection call now passes depth=4 and a fresh visited Set
 // FIX 3 — variables block now calls buildInputObject for InputObjectTypes
 //   so variables are fully populated instead of being set to null
+// ─── FIX: normalise introspection result before buildClientSchema ────────────
+// graphql-js's buildClientSchema is strict and throws "Introspection result
+// missing <x>" when a server (commonly a graphql-java backend) omits a field it
+// expects — e.g. a directive without `args` (the marker directive `oneOf`), or
+// an OBJECT type without `interfaces`. These are returned as absent instead of
+// as empty arrays. Default every kind-specific collection graphql-js requires
+// so a schema that is otherwise complete still builds. Only missing values are
+// filled in; anything the server did return is left untouched.
+function sanitizeIntrospection(introspectionData) {
+  const schema = introspectionData && introspectionData.__schema;
+  if (!schema) return introspectionData;
+
+  // Directives — default the fields graphql-js requires on each.
+  if (Array.isArray(schema.directives)) {
+    schema.directives = schema.directives.map(d => ({
+      ...d,
+      args: Array.isArray(d.args) ? d.args : [],
+      locations: Array.isArray(d.locations) ? d.locations : [],
+      isRepeatable: typeof d.isRepeatable === 'boolean' ? d.isRepeatable : false,
+    }));
+  }
+
+  // Types — default the collections graphql-js requires for each type kind.
+  if (Array.isArray(schema.types)) {
+    const normaliseFields = t => {
+      if (Array.isArray(t.fields)) {
+        t.fields.forEach(f => { if (!Array.isArray(f.args)) f.args = []; });
+      } else {
+        t.fields = [];
+      }
+    };
+    for (const t of schema.types) {
+      if (!t || !t.kind) continue;
+      switch (t.kind) {
+        case 'OBJECT':
+          if (!Array.isArray(t.interfaces)) t.interfaces = [];
+          normaliseFields(t);
+          break;
+        case 'INTERFACE':
+          if (!Array.isArray(t.interfaces)) t.interfaces = [];
+          if (!Array.isArray(t.possibleTypes)) t.possibleTypes = [];
+          normaliseFields(t);
+          break;
+        case 'UNION':
+          if (!Array.isArray(t.possibleTypes)) t.possibleTypes = [];
+          break;
+        case 'ENUM':
+          if (!Array.isArray(t.enumValues)) t.enumValues = [];
+          break;
+        case 'INPUT_OBJECT':
+          if (!Array.isArray(t.inputFields)) t.inputFields = [];
+          break;
+      }
+    }
+  }
+
+  return introspectionData;
+}
+
 function extractOperationsFromSchema(introspectionData, endpoint) {
-  const schema = buildClientSchema(introspectionData);
+  // assumeValid: true — skip strict schema validation so a non-standard but
+  // usable schema still yields operations (this is a recon tool, not a linter).
+  const schema = buildClientSchema(sanitizeIntrospection(introspectionData), { assumeValid: true });
   const ops = [];
 
   const typeMap = {
@@ -788,6 +860,8 @@ program
   .option('--aggressive',             'Enable all detection passes (slower, catches more)')
   .option('--verbose',                'Verbose logging — shows each introspection bypass attempt')
   .option('--headers <json>',         'JSON headers e.g. \'{"Authorization":"Bearer TOKEN","Cookie":"s=abc"}\'')
+  .option('--auth <token>',           'Bearer token — sent as "Authorization: Bearer <token>" (can be combined with --cookie)')
+  .option('--cookie <string>',        'Cookie header value — sent as "Cookie: <string>" (can be combined with --auth)')
   .option('--retries <n>',            'Fetch retry attempts for remote files', parseInt, FETCH_RETRIES)
   .parse(process.argv);
 
@@ -805,6 +879,18 @@ if (options.headers) {
     console.error(`❌ Invalid --headers value: ${e.message}`);
     process.exit(1);
   }
+}
+
+// ─── FIX 1: convenience flags for bearer auth + cookie (usable together) ──────
+// Both merge into customHeaders alongside --headers. If a key is already present
+// via --headers it is not overwritten, so --headers stays the explicit override.
+if (options.auth) {
+  const token = String(options.auth).trim();
+  const bearer = /^bearer\s/i.test(token) ? token : `Bearer ${token}`;
+  if (!('Authorization' in customHeaders)) customHeaders.Authorization = bearer;
+}
+if (options.cookie) {
+  if (!('Cookie' in customHeaders)) customHeaders.Cookie = String(options.cookie);
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
