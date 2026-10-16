@@ -2,7 +2,7 @@
 
 A Node.js CLI tool for extracting GraphQL operations from JavaScript code, including support for minified/bundled code and remote file analysis — optimized for JS auditing and recon. Inspired by  [LinkFinder](https://github.com/GerbenJavado/LinkFinder)
 
-![Demo](Schemafinder/demo.gif)
+![Demo](assets/schemafinder-cli-demo.gif)
 
 
 # How it works
